@@ -398,11 +398,14 @@ impl HostStore {
     fn import_parsed(&mut self, config: crate::ssh_config::SSHConfig) -> std::io::Result<usize> {
         let existing: std::collections::HashSet<String> =
             self.all().iter().map(|h| h.alias.to_lowercase()).collect();
-        let fresh: Vec<Host> = crate::ssh_config::imported_hosts(&config)
+        let mut fresh: Vec<Host> = crate::ssh_config::imported_hosts(&config)
             .into_iter()
             .filter(|h| !existing.contains(&h.alias.to_lowercase()))
             .collect();
         let count = fresh.len();
+        if count == 0 {
+            return Ok(0);
+        }
         let imported: Vec<(String, Option<String>)> = fresh
             .iter()
             .map(|h| {
@@ -411,39 +414,33 @@ impl HostStore {
                 (h.alias.clone(), jump)
             })
             .collect();
-        for host in fresh {
-            self.upsert(host)?;
-        }
-
-        // Andra pass: koppla ihop ProxyJump. Måste ske EFTER att alla
-        // värdar sparats — jump-hosten kan stå efter den som pekar på den i
-        // configen, och en koppling kräver mottagarens id.
-        //
-        // Bara nyimporterade värdar får sin jump satt. Att röra en värd som
-        // redan fanns vore att tyst skriva om något användaren kan ha ställt
-        // in själv, och hela importen bygger på att befintliga alias lämnas
-        // ifred.
-        let by_alias: std::collections::HashMap<String, Uuid> = self
-            .all()
-            .iter()
-            .map(|h| (h.alias.to_lowercase(), h.id))
+        // Resolve against both existing and new hosts before writing anything.
+        // The index points into fresh only; existing hosts are never changed.
+        let mut by_alias: HashMap<String, (Uuid, Option<usize>)> = self.state.hosts.iter()
+            .map(|h| (h.alias.to_lowercase(), (h.id, None)))
             .collect();
+        for (index, host) in fresh.iter().enumerate() {
+            by_alias.insert(host.alias.to_lowercase(), (host.id, Some(index)));
+        }
         for (alias, jump_alias) in imported {
             let Some(jump_alias) = jump_alias else { continue };
-            let Some(&jump_id) = by_alias.get(&jump_alias.to_lowercase()) else { continue };
-            let Some(&id) = by_alias.get(&alias.to_lowercase()) else { continue };
-            // En värd som pekar på sig själv är ingen kedja, bara ett fel.
+            let Some(&(jump_id, _)) = by_alias.get(&jump_alias.to_lowercase()) else { continue };
+            let Some(&(id, Some(index))) = by_alias.get(&alias.to_lowercase()) else { continue };
             if id == jump_id {
                 continue;
             }
-            // `all()` ger `Vec<&Host>`, så en `cloned()` på iteratorn ger
-            // fortfarande en referens — klona värden explicit.
-            let Some(mut host) = self.all().into_iter().find(|h| h.id == id).cloned() else {
-                continue;
-            };
-            host.jump_host_id = Some(jump_id);
-            self.upsert(host)?;
+            fresh[index].jump_host_id = Some(jump_id);
         }
+
+        // Commit the complete batch once; a failed write leaves memory intact.
+        let mut state = self.state.clone();
+        for mut host in fresh {
+            host.modified_at = ReferenceDate::now();
+            state.tombstones.remove(&host.id);
+            state.hosts.push(host);
+        }
+        self.persist_state(&state)?;
+        self.state = state;
         Ok(count)
     }
 
@@ -483,6 +480,10 @@ impl HostStore {
     }
 
     fn persist(&self) -> std::io::Result<()> {
+        self.persist_state(&self.state)
+    }
+
+    fn persist_state(&self, state: &SyncState) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
@@ -491,7 +492,7 @@ impl HostStore {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
-        let json = serde_json::to_string_pretty(&self.state)?;
+        let json = serde_json::to_string_pretty(state)?;
         crate::fsutil::atomic_write(&self.path, json.as_bytes())
     }
 
@@ -665,6 +666,57 @@ mod tests {
         assert_eq!(reopened.all().len(), 1);
         assert_eq!(reopened.all()[0].id, id);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn import_persists_complete_batch_and_preserves_existing_state() {
+        let dir = std::env::temp_dir().join(format!("bastion-import-test-{}", Uuid::new_v4()));
+        let path = dir.join("hosts.json");
+        let mut store = HostStore::open(path.clone()).unwrap();
+        let existing = Host::new("existing".into(), "original.example.com".into(), "user".into());
+        let existing_id = existing.id;
+        store.upsert(existing).unwrap();
+        let deleted_id = Uuid::new_v4();
+        store.record_tombstone(deleted_id).unwrap();
+        store.state.snippets.push(crate::snippet::Snippet::new("example".into(), "echo example".into()));
+
+        let config = "Host existing\n  User changed\n  HostName changed.example.com\n\
+                      Host target\n  User user\n  ProxyJump later\n\
+                      Host later\n  User user\n  ProxyJump existing\n";
+        assert_eq!(store.import_ssh_config(config).unwrap(), 2);
+
+        let reopened = HostStore::open(path).unwrap();
+        let hosts = reopened.all();
+        let existing = hosts.iter().find(|h| h.alias == "existing").unwrap();
+        let target = hosts.iter().find(|h| h.alias == "target").unwrap();
+        let later = hosts.iter().find(|h| h.alias == "later").unwrap();
+        assert_eq!(existing.id, existing_id);
+        assert_eq!(existing.host_name, "original.example.com");
+        assert_eq!(target.jump_host_id, Some(later.id));
+        assert_eq!(later.jump_host_id, Some(existing_id));
+        assert!(reopened.state.tombstones.contains_key(&deleted_id));
+        assert_eq!(reopened.state.snippets.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn import_failure_keeps_the_previous_memory_and_disk_state() {
+        let dir = std::env::temp_dir().join(format!("bastion-import-test-{}", Uuid::new_v4()));
+        let path = dir.join("hosts.json");
+        let mut store = HostStore::open(path.clone()).unwrap();
+        store.upsert(Host::new("existing".into(), "existing.example.com".into(), "user".into())).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        store.path = blocker.join("hosts.json");
+
+        assert!(store.import_ssh_config("Host new\n  User user\n").is_err());
+        assert_eq!(store.all().len(), 1);
+        assert_eq!(store.all()[0].alias, "existing");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A no-op import needs no write, even if the destination is unusable.
+        assert_eq!(store.import_ssh_config("Host EXISTING\n  User user\n").unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn store_with(hosts: Vec<Host>) -> HostStore {
