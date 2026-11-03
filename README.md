@@ -40,3 +40,11 @@ cd LinuxApp && cargo run
 - [The documentation](https://pissmyran.github.io/bastion_linux/): getting started, architecture, operations, sync format and releases
 - [SECURITY.md](SECURITY.md): report a vulnerability
 - [CONTRIBUTING.md](CONTRIBUTING.md): contribute
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:fcc6dd7ee580e2710ceec1a8d0e8f87165d2bcadccc4dcc285c89a6b9b13ab9b -->
+
+SFTP image previews accept files up to 25 MiB and images up to 4096 × 4096 pixels. Larger images can be downloaded instead.
+
+<!-- /coderabbit-ai-generated:v1 -->

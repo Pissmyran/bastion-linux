@@ -34,3 +34,11 @@ cd LinuxApp && cargo run
 | `LinuxApp/integrations/` | Integrations, for example Docker |
 | `LinuxApp/tests/fixtures/` | Copies of the sync-format fixtures from Bastion for Apple |
 | `LinuxApp/packaging/` | Desktop file and RPM build |
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:62d04f982b71a0e1ccf3f4ff148c63ebfbc3cf98077b4f46a3c6b561784a97c4 -->
+
+SFTP image previews accept files up to 25 MiB and images up to 4096 × 4096 pixels. Decoding uses a resource-limited helper process; only one preview can load at a time.
+
+<!-- /coderabbit-ai-generated:v1 -->
