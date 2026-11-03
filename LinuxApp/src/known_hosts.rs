@@ -127,19 +127,25 @@ impl KnownHosts {
 
     /// Avgör hur en presenterad nyckel förhåller sig till vad vi sett
     /// tidigare. Lär in nyckeln (och persisterar) om värden är ny.
-    pub fn check(&self, host: &str, port: u16, key_string: &str) -> Verdict {
+    pub fn check(&self, host: &str, port: u16, key_string: &str) -> std::io::Result<Verdict> {
         let id = format!("{host}:{port}");
+        let _lock = self.store_lock()?;
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
+        if self.path.is_some() {
+            *entries = Self::load(self.path.as_deref())?;
+        }
         if let Some(stored) = entries.get(&id) {
             if stored == key_string {
-                Verdict::Trusted
+                Ok(Verdict::Trusted)
             } else {
-                Verdict::Changed(stored.clone())
+                Ok(Verdict::Changed(stored.clone()))
             }
         } else {
-            entries.insert(id.clone(), key_string.to_string());
-            self.append(&id, key_string);
-            Verdict::Learned
+            let mut updated = entries.clone();
+            updated.insert(id, key_string.to_string());
+            self.save(&updated)?;
+            *entries = updated;
+            Ok(Verdict::Learned)
         }
     }
 
@@ -163,20 +169,28 @@ impl KnownHosts {
 
     /// Glömmer en värd. Sant om den fanns.
     ///
-    /// Hela filen skrivs om — `append` duger inte för borttagning — och
+    /// Hela filen skrivs om, och
     /// det sker atomiskt via `fsutil::atomic_write`, så ett avbrott mitt i
     /// inte kan lämna en HALV `known_hosts` efter sig. En halv fil är
     /// värre än ingen: de värdar som försvann blir tysta `Learned` igen
     /// nästa gång, alltså precis det MITM-skydd filen finns för.
     pub fn forget(&self, id: &str) -> std::io::Result<bool> {
+        let _lock = self.store_lock()?;
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
-        if entries.remove(id).is_none() {
+        if self.path.is_some() {
+            *entries = Self::load(self.path.as_deref())?;
+        }
+        let mut updated = entries.clone();
+        if updated.remove(id).is_none() {
             return Ok(false);
         }
-        let Some(path) = &self.path else {
-            return Ok(true);
-        };
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(true)
+    }
 
+    fn save(&self, entries: &HashMap<String, String>) -> std::io::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
         let mut lines: Vec<String> = entries
             .iter()
             .map(|(id, key)| format!("{id} {key}"))
@@ -192,31 +206,33 @@ impl KnownHosts {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        Ok(true)
+        Ok(())
     }
 
-    fn append(&self, id: &str, key_string: &str) {
-        let Some(path) = &self.path else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    // The data file is replaced on writes, so lock a stable sibling instead.
+    // Keep it on disk: removing it could split waiters across different inodes.
+    fn store_lock(&self) -> std::io::Result<Option<std::fs::File>> {
+        let Some(path) = &self.path else { return Ok(None) };
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
             }
         }
-        let existed = path.exists();
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(format!("{id} {key_string}\n").as_bytes());
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        if !existed {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        let file = options.open(lock_path)?;
+        file.lock()?;
+        Ok(Some(file))
     }
 }
 
@@ -225,26 +241,28 @@ mod tests {
     use super::*;
 
     fn temp_path() -> PathBuf {
-        std::env::temp_dir().join(format!("bastion-known-hosts-test-{}", uuid::Uuid::new_v4()))
+        let dir = std::env::temp_dir().join(format!("bastion-known-hosts-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("known_hosts")
     }
 
     #[test]
     fn learns_a_new_host_then_trusts_it() {
         let path = temp_path();
         let kh = KnownHosts::open(Some(path.clone())).unwrap();
-        assert_eq!(kh.check("example.com", 22, "ssh-ed25519 AAAA1"), Verdict::Learned);
-        assert_eq!(kh.check("example.com", 22, "ssh-ed25519 AAAA1"), Verdict::Trusted);
-        std::fs::remove_file(path).ok();
+        assert_eq!(kh.check("example.com", 22, "ssh-ed25519 AAAA1").unwrap(), Verdict::Learned);
+        assert_eq!(kh.check("example.com", 22, "ssh-ed25519 AAAA1").unwrap(), Verdict::Trusted);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn detects_a_changed_key() {
         let path = temp_path();
         let kh = KnownHosts::open(Some(path.clone())).unwrap();
-        kh.check("example.com", 22, "ssh-ed25519 AAAA1");
-        let verdict = kh.check("example.com", 22, "ssh-ed25519 AAAA2-ANNAN-NYCKEL");
+        kh.check("example.com", 22, "ssh-ed25519 AAAA1").unwrap();
+        let verdict = kh.check("example.com", 22, "ssh-ed25519 AAAA2-ANNAN-NYCKEL").unwrap();
         assert_eq!(verdict, Verdict::Changed("ssh-ed25519 AAAA1".into()));
-        std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -252,20 +270,20 @@ mod tests {
         let path = temp_path();
         {
             let kh = KnownHosts::open(Some(path.clone())).unwrap();
-            kh.check("mp100", 22, "ssh-ed25519 AAAAPERSIST");
+            kh.check("mp100", 22, "ssh-ed25519 AAAAPERSIST").unwrap();
         }
         let reopened = KnownHosts::open(Some(path.clone())).unwrap();
-        assert_eq!(reopened.check("mp100", 22, "ssh-ed25519 AAAAPERSIST"), Verdict::Trusted);
-        std::fs::remove_file(path).ok();
+        assert_eq!(reopened.check("mp100", 22, "ssh-ed25519 AAAAPERSIST").unwrap(), Verdict::Trusted);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn different_ports_are_independent_hosts() {
         let path = temp_path();
         let kh = KnownHosts::open(Some(path.clone())).unwrap();
-        assert_eq!(kh.check("h", 22, "keyA"), Verdict::Learned);
-        assert_eq!(kh.check("h", 2222, "keyB"), Verdict::Learned);
-        std::fs::remove_file(path).ok();
+        assert_eq!(kh.check("h", 22, "keyA").unwrap(), Verdict::Learned);
+        assert_eq!(kh.check("h", 2222, "keyB").unwrap(), Verdict::Learned);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Att filen inte finns än (första körningen) är HELT normalt och ska
@@ -275,8 +293,8 @@ mod tests {
         let path = temp_path();
         assert!(!path.exists());
         let kh = KnownHosts::open(Some(path.clone())).expect("saknad fil ska inte vara ett fel");
-        assert_eq!(kh.check("ny-värd", 22, "keyA"), Verdict::Learned);
-        std::fs::remove_file(path).ok();
+        assert_eq!(kh.check("ny-värd", 22, "keyA").unwrap(), Verdict::Learned);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// SÄKERHETSREGRESSION: ett läsfel som INTE är "filen saknas" får
@@ -305,7 +323,7 @@ mod tests {
             "felet ska inte vara NotFound — det fallet är det enda som får ge en tom lagring"
         );
 
-        std::fs::remove_dir_all(path).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// En RIKTIG ed25519-nyckel och det fingeravtryck `ssh-keygen -lf`
@@ -343,9 +361,9 @@ mod tests {
     fn entries_are_listed_sorted_and_forget_removes_one_for_good() {
         let path = temp_path();
         let kh = KnownHosts::open(Some(path.clone())).unwrap();
-        kh.check("zeta.example", 22, "ssh-ed25519 AAAAZ");
-        kh.check("alfa.example", 22, "ssh-ed25519 AAAAA");
-        kh.check("alfa.example", 2222, "ssh-ed25519 AAAAB");
+        kh.check("zeta.example", 22, "ssh-ed25519 AAAAZ").unwrap();
+        kh.check("alfa.example", 22, "ssh-ed25519 AAAAA").unwrap();
+        kh.check("alfa.example", 2222, "ssh-ed25519 AAAAB").unwrap();
 
         let ids: Vec<String> = kh.entries().into_iter().map(|e| e.id).collect();
         assert_eq!(
@@ -366,16 +384,105 @@ mod tests {
         let ids: Vec<String> = reopened.entries().into_iter().map(|e| e.id).collect();
         assert_eq!(ids, vec!["alfa.example:2222", "zeta.example:22"]);
         assert_eq!(
-            reopened.check("alfa.example", 2222, "ssh-ed25519 AAAAB"),
+            reopened.check("alfa.example", 2222, "ssh-ed25519 AAAAB").unwrap(),
             Verdict::Trusted,
             "den kvarvarande värden ska fortfarande vara betrodd, inte inlärd på nytt"
         );
         assert_eq!(
-            reopened.check("alfa.example", 22, "ssh-ed25519 AAAA-NY"),
+            reopened.check("alfa.example", 22, "ssh-ed25519 AAAA-NY").unwrap(),
             Verdict::Learned,
             "den glömda värden ska läras in på nytt, inte rapporteras som ändrad"
         );
 
-        std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn stale_instances_keep_other_keys_and_check_current_keys() {
+        let path = temp_path();
+        let forgetting = KnownHosts::open(Some(path.clone())).unwrap();
+        let learning = KnownHosts::open(Some(path.clone())).unwrap();
+        forgetting.check("old.example", 22, "old-key").unwrap();
+        assert_eq!(learning.check("new.example", 22, "new-key").unwrap(), Verdict::Learned);
+        assert!(forgetting.forget("old.example:22").unwrap());
+
+        let reopened = KnownHosts::open(Some(path.clone())).unwrap();
+        assert_eq!(reopened.check("new.example", 22, "attacker-key").unwrap(), Verdict::Changed("new-key".into()));
+        assert_eq!(learning.check("old.example", 22, "replacement-key").unwrap(), Verdict::Learned);
+        assert_eq!(forgetting.check("old.example", 22, "old-key").unwrap(), Verdict::Changed("replacement-key".into()));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn simultaneous_first_use_cannot_learn_two_different_keys() {
+        let path = temp_path();
+        let first = KnownHosts::open(Some(path.clone())).unwrap();
+        let second = KnownHosts::open(Some(path.clone())).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other = barrier.clone();
+        let thread = std::thread::spawn(move || {
+            other.wait();
+            first.check("example.com", 22, "key-one").unwrap()
+        });
+        barrier.wait();
+        let second_result = second.check("example.com", 22, "key-two").unwrap();
+        let first_result = thread.join().unwrap();
+        assert!(matches!((first_result, second_result),
+            (Verdict::Learned, Verdict::Changed(_)) | (Verdict::Changed(_), Verdict::Learned)));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lock_is_shared_with_other_processes() {
+        const CHILD_PATH: &str = "BASTION_TEST_LOCK_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let mut lock_path = path;
+            lock_path.push(".lock");
+            let file = std::fs::OpenOptions::new().write(true).open(lock_path).unwrap();
+            assert!(matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            return;
+        }
+        let path = temp_path();
+        let known = KnownHosts::open(Some(path.clone())).unwrap();
+        let lock = known.store_lock().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "known_hosts::tests::lock_is_shared_with_other_processes"])
+            .env(CHILD_PATH, &path)
+            .status().unwrap();
+        assert!(status.success());
+        drop(lock);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn failed_reload_or_lock_never_accepts_a_key() {
+        let path = temp_path();
+        let known = KnownHosts::open(Some(path.clone())).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(known.check("example.com", 22, "key").is_err());
+        assert!(known.forget("example.com:22").is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(known.check("example.com", 22, "key").is_err());
+        assert!(known.forget("example.com:22").is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn failed_save_does_not_change_the_trust_store_or_cache() {
+        let root = temp_path();
+        // The data and lock filenames fit, but atomic_write's longer temp name does not.
+        let path = root.parent().unwrap().join("x".repeat(240));
+        std::fs::write(&path, "old.example:22 old-key\n").unwrap();
+        let known = KnownHosts::open(Some(path.clone())).unwrap();
+        assert!(known.check("new.example", 22, "new-key").is_err());
+        assert!(known.forget("old.example:22").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old.example:22 old-key\n");
+        assert_eq!(known.entries().len(), 1);
+        assert_eq!(known.entries()[0].id, "old.example:22");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
