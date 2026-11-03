@@ -33,3 +33,4 @@ The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 - **The fixtures** in `LinuxApp/tests/fixtures/` are copies of the sync format owned by `bastion_apple`.
 - **RSA is disabled** in russh; `docs/rsa-disabled.md` gives the reason and the condition for enabling it.
 - **Extra care:** host key verification, sync format and encryption, OAuth and WebDAV, forwarding and fetched tools.
+- SFTP uploads skip directory symlinks and keep directory traversal anchored to open descriptors.
