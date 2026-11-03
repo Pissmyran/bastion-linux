@@ -26,6 +26,16 @@ cd LinuxApp && cargo run
 
 `openssh-client` is needed because the key import tests run `ssh-keygen`. The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:0b8183dc5bd147570beae2d7db6abbbb3cd2d9ba6997a6df4c0c1799c4a46e3a -->
+
+## SSH config import
+
+File import follows `Include` directives in order. It skips missing files and active include cycles. To bound resource use, imports fail before saving hosts if the expanded config exceeds 512 file attempts or include targets, 1 MiB of data, 4,096 entries, 256 host patterns, or 8,192 directory entries scanned. The existing include depth limit is 16.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 ## Contents
 
 | Path | Contents |
