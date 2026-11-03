@@ -23,4 +23,4 @@ Bastion for Linux is a standalone Rust app. It shares no code with the other pla
 
 ## Security boundary
 
-Host key verification in `known_hosts.rs` rejects a changed key for the same host and port. Keys and passwords are never stored in the repo or in test data.
+Host key verification in `known_hosts.rs` rejects a changed key for the same host and port. Hostnames containing whitespace or control characters are rejected, and conflicting entries in the trust store prevent connections until resolved. Keys and passwords are never stored in the repo or in test data.
