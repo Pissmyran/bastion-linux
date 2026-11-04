@@ -48,24 +48,16 @@ pub struct WebDavSyncProvider {
 /// avlyssna. Undantaget behövs för att kunna testa mot en lokal server
 /// utan att sätta upp TLS — men det är också det enda fall där det är
 /// ofarligt.
-pub fn credentials_may_be_sent(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return true;
+fn validated_url(input: &str) -> Result<reqwest::Url, WebDavError> {
+    let url = reqwest::Url::parse(input).map_err(|_| WebDavError::InsecureUrl)?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(WebDavError::InsecureUrl);
     }
-    if let Some(rest) = lower.strip_prefix("http://") {
-        // En IPv6-litteral står inom hakparenteser och innehåller
-        // KOLON — att dela på `:` styckar sönder `[::1]` och ger `[`.
-        // Den formen måste alltså plockas ut för sig innan portens
-        // avgränsare får någon betydelse.
-        let host = if let Some(end) = rest.find(']') {
-            if rest.starts_with('[') { &rest[..=end] } else { "" }
-        } else {
-            rest.split(['/', ':', '?', '#']).next().unwrap_or("")
-        };
-        return matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")) => Ok(url),
+        _ => Err(WebDavError::InsecureUrl),
     }
-    false
 }
 
 /// Vad som gick fel, i den detalj som går att åtgärda.
@@ -97,8 +89,8 @@ impl std::fmt::Display for WebDavError {
             WebDavError::Malformed(e) => write!(f, "svaret gick inte att tolka: {e}"),
             WebDavError::InsecureUrl => write!(
                 f,
-                "URL:en måste börja med https:// — basic auth är Base64, inte kryptering, \
-                 så över http:// skickas användarnamn och lösenord i klartext"
+                "Ange en giltig https://-URL utan inloggningsuppgifter i URL:en \
+                 (http:// tillåts bara för loopback). Basic auth är inte krypterad"
             ),
         }
     }
@@ -144,8 +136,13 @@ impl WebDavSyncProvider {
         WebDavSyncProvider { url, username, password }
     }
 
-    fn client() -> Result<reqwest::Client, WebDavError> {
-        reqwest::Client::builder()
+    fn client(url: &reqwest::Url) -> Result<reqwest::Client, WebDavError> {
+        let mut builder = reqwest::Client::builder();
+        // A proxy would send plaintext loopback credentials over the network.
+        if url.scheme() == "http" {
+            builder = builder.no_proxy();
+        }
+        builder
             // En synk som hänger blockerar hela sparflödet. Trettio
             // sekunder räcker för en trög hemmaserver och är kort nog att
             // inte se ut som att appen frusit.
@@ -171,13 +168,11 @@ impl WebDavSyncProvider {
 
 impl SyncProvider for WebDavSyncProvider {
     fn pull(&self) -> std::io::Result<Option<SyncState>> {
-        if !credentials_may_be_sent(&self.url) {
-            return Err(WebDavError::InsecureUrl.into());
-        }
-        let client = Self::client()?;
+        let url = validated_url(&self.url)?;
+        let client = Self::client(&url)?;
         let (status, body) = Self::block_on(async {
             let response = client
-                .get(&self.url)
+                .get(url)
                 .basic_auth(&self.username, Some(&self.password))
                 .send()
                 .await
@@ -209,16 +204,14 @@ impl SyncProvider for WebDavSyncProvider {
     }
 
     fn push(&self, state: &SyncState) -> std::io::Result<()> {
-        if !credentials_may_be_sent(&self.url) {
-            return Err(WebDavError::InsecureUrl.into());
-        }
+        let url = validated_url(&self.url)?;
         let body = serde_json::to_string_pretty(state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let client = Self::client()?;
+        let client = Self::client(&url)?;
         let status = Self::block_on(async {
             let response = client
-                .put(&self.url)
+                .put(url)
                 .basic_auth(&self.username, Some(&self.password))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body)
@@ -267,38 +260,48 @@ mod tests {
     /// synken vägra göra — inte göra tyst för att någon utelämnat ett s.
     #[test]
     fn credentials_only_go_over_https_or_loopback() {
-        assert!(credentials_may_be_sent("https://moln.example/dav/b.json"));
-        assert!(credentials_may_be_sent("HTTPS://MOLN.EXAMPLE/dav/b.json"), "schemat är skiftlägesokänsligt");
+        assert!(validated_url("https://moln.example/dav/b.json").is_ok());
+        assert!(validated_url("HTTPS://MOLN.EXAMPLE/dav/b.json").is_ok(), "schemat är skiftlägesokänsligt");
 
         // Loopback är ofarligt och behövs för att kunna testa utan TLS.
-        assert!(credentials_may_be_sent("http://127.0.0.1:8080/b.json"));
-        assert!(credentials_may_be_sent("http://localhost/b.json"));
-        assert!(credentials_may_be_sent("http://[::1]:9000/b.json"));
+        assert!(validated_url("http://127.0.0.1:8080/b.json").is_ok());
+        assert!(validated_url("http://localhost/b.json").is_ok());
+        assert!(validated_url("http://[::1]:9000/b.json").is_ok());
 
         // Allt annat över http är klartext.
-        assert!(!credentials_may_be_sent("http://moln.example/dav/b.json"));
-        assert!(!credentials_may_be_sent("http://192.168.1.10/b.json"), "LAN är inte loopback");
-        assert!(!credentials_may_be_sent("http://127.0.0.1.evil.example/b.json"),
+        assert!(validated_url("http://moln.example/dav/b.json").is_err());
+        assert!(validated_url("http://192.168.1.10/b.json").is_err(), "LAN är inte loopback");
+        assert!(validated_url("http://127.0.0.1.evil.example/b.json").is_err(),
                 "ett värdnamn som BÖRJAR med 127.0.0.1 är inte loopback");
-        assert!(!credentials_may_be_sent("ftp://moln.example/b.json"));
-        assert!(!credentials_may_be_sent(""));
+        assert!(validated_url("ftp://moln.example/b.json").is_err());
+        assert!(validated_url("").is_err());
+        let (_, password) = generated_credentials();
+        for url in [
+            format!("http://127.0.0.1:{password}@example.com/b.json"),
+            format!("http://localhost:{password}@example.com/b.json"),
+            "http://[::1]@example.com/b.json".into(),
+            "http://user@localhost/b.json".into(),
+            "https://user@example.com/b.json".into(),
+            format!("https://:{password}@example.com/b.json"),
+            "https://example.com:invalid/b.json".into(),
+        ] {
+            assert!(validated_url(&url).is_err(), "URL with userinfo or invalid port must be rejected");
+        }
     }
 
     /// Kontrollen ska ske FÖRE anropet, så inget skickas ens en gång.
     #[test]
     fn an_insecure_url_fails_before_anything_is_sent() {
         let (user, password) = generated_credentials();
-        let provider = WebDavSyncProvider::new(
-            "http://moln.example/dav/b.json".into(),
-            user,
-            password,
-        );
-        let pull = provider.pull().expect_err("http skulle avvisats");
-        assert_eq!(pull.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(pull.to_string().contains("https://"), "felet ska säga vad som krävs");
+        for url in ["http://moln.example/dav/b.json".into(), format!("http://127.0.0.1:{password}@example.com/b.json"), "http://[::1]@example.com/b.json".into()] {
+            let provider = WebDavSyncProvider::new(url, user.clone(), password.clone());
+            let pull = provider.pull().expect_err("http skulle avvisats");
+            assert_eq!(pull.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(pull.to_string().contains("https://"), "felet ska säga vad som krävs");
 
-        let push = provider.push(&SyncState::default()).expect_err("http skulle avvisats");
-        assert_eq!(push.kind(), std::io::ErrorKind::InvalidInput);
+            let push = provider.push(&SyncState::default()).expect_err("http skulle avvisats");
+            assert_eq!(push.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     /// Felen ska gå att skilja åt i gränssnittet — ett nätverksfel och ett
