@@ -374,8 +374,8 @@ async fn handle_redirect_connection(mut socket: tokio::net::TcpStream, expected_
         }
     };
     let body = match &result {
-        Ok(_) => "<html><body>Inloggningen lyckades — du kan stänga den här fliken.</body></html>".to_string(),
-        Err(e) => format!("<html><body>Inloggningen misslyckades: {e}</body></html>"),
+        Ok(_) => "<html><body>Inloggningen lyckades — du kan stänga den här fliken.</body></html>",
+        Err(_) => "<html><body>Inloggningen misslyckades — du kan stänga den här fliken.</body></html>",
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -702,6 +702,21 @@ mod tests {
 
         let err = await_redirect(listener, "any-state").await.expect_err("ett leverantörsfel ska ge Err, inte Ok");
         assert!(err.contains("access_denied"), "felet ska innehålla leverantörens felkod, fick: {err}");
+    }
+
+    #[tokio::test]
+    async fn provider_error_cannot_inject_html_into_browser_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = tokio::spawn(async move {
+            reqwest::get(format!("http://127.0.0.1:{port}/callback?error=%3Cscript%3Ealert(1)%3C%2Fscript%3E")).await
+        });
+
+        let err = await_redirect(listener, "any-state").await.expect_err("provider error should fail login");
+        assert!(err.contains("<script>alert(1)</script>"));
+        let response = browser.await.unwrap().unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.text().await.unwrap(), "<html><body>Inloggningen misslyckades — du kan stänga den här fliken.</body></html>");
     }
 
     #[tokio::test]
