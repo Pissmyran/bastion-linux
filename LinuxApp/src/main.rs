@@ -32,6 +32,7 @@ mod s3;
 mod serial;
 mod settings;
 mod sftp;
+mod image_preview;
 mod snippet;
 mod socks_proxy;
 mod split;
@@ -111,6 +112,9 @@ fn host_color_dot(color_tag: &Option<String>) -> Option<gtk::Widget> {
 }
 
 fn main() -> glib::ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--decode-sftp-preview")) {
+        std::process::exit(if image_preview::run_decoder().is_ok() { 0 } else { 1 });
+    }
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
@@ -10356,12 +10360,7 @@ fn prompt_permissions(
     win.present();
 }
 
-/// Visar en bildfil i stället för att öppna den i textredigeraren.
-/// VISION.md listar förhandsvisning under SFTP-filhanteraren; utan den
-/// hamnade en PNG i en textbuffert som binärskräp.
-///
-/// Storleken kontrolleras INNAN nedladdningen — `handle.read` läser hela
-/// filen till minne, och katalogen kan innehålla flergigabytesfiler.
+/// Shows an image preview with bounded input and decoding resources.
 fn open_sftp_image_preview(area: &Rc<SessionArea>, handle: sftp::SftpHandle, path: String, size: u64) {
     let status = gtk::Label::builder()
         .label("Hämtar …")
@@ -10397,6 +10396,10 @@ fn open_sftp_image_preview(area: &Rc<SessionArea>, handle: sftp::SftpHandle, pat
         return;
     }
 
+    let Some(permit) = image_preview::try_acquire() else {
+        status.set_label("En bild förhandsvisas redan. Försök igen om en stund.");
+        return;
+    };
     glib::spawn_future_local(clone!(
         #[strong]
         handle,
@@ -10407,21 +10410,35 @@ fn open_sftp_image_preview(area: &Rc<SessionArea>, handle: sftp::SftpHandle, pat
         #[weak]
         picture,
         async move {
-            match handle.read(path).await {
-                Ok(bytes) => {
-                    // GDK avgör själv formatet ur innehållet. Att det
-                    // misslyckas är helt normalt — filnamnet gissade bara
-                    // att det VAR en bild — så felet visas, inget kraschar.
-                    match gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                        Ok(texture) => {
-                            picture.set_paintable(Some(&texture));
-                            picture.set_visible(true);
-                            status.set_visible(false);
-                        }
-                        Err(e) => status.set_label(&format!("Kunde inte tolka filen som en bild: {e}")),
-                    }
+            let bytes = match handle.read_preview(path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    status.set_label(&format!("Kunde inte hämta filen: {e}"));
+                    return;
                 }
-                Err(e) => status.set_label(&format!("Kunde inte hämta filen: {e}")),
+            };
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = image_preview::decode(bytes);
+                drop(permit);
+                let _ = tx.send_blocking(result);
+            });
+            match rx.recv().await {
+                Ok(Ok(image)) => {
+                    let format = if image.channels == 4 {
+                        gtk::gdk::MemoryFormat::R8g8b8a8
+                    } else {
+                        gtk::gdk::MemoryFormat::R8g8b8
+                    };
+                    let texture = gtk::gdk::MemoryTexture::new(
+                        image.width, image.height, format,
+                        &glib::Bytes::from_owned(image.pixels), image.stride,
+                    );
+                    picture.set_paintable(Some(&texture));
+                    picture.set_visible(true);
+                    status.set_visible(false);
+                }
+                _ => status.set_label("Kunde inte tolka bilden eller bilden är för stor för förhandsvisning."),
             }
         }
     ));

@@ -11,7 +11,7 @@
 use crate::host::Host;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -32,6 +32,7 @@ pub struct Entry {
 enum Command {
     List { path: String, reply: async_channel::Sender<Result<Vec<Entry>, String>> },
     Read { path: String, reply: async_channel::Sender<Result<Vec<u8>, String>> },
+    ReadPreview { path: String, reply: async_channel::Sender<Result<Vec<u8>, String>> },
     Write { path: String, data: Vec<u8>, reply: async_channel::Sender<Result<(), String>> },
     Mkdir { path: String, reply: async_channel::Sender<Result<(), String>> },
     RemoveFile { path: String, reply: async_channel::Sender<Result<(), String>> },
@@ -56,6 +57,11 @@ impl SftpHandle {
     pub async fn read(&self, path: String) -> Result<Vec<u8>, String> {
         let (reply, rx) = async_channel::bounded(1);
         self.send(Command::Read { path, reply }, rx).await
+    }
+
+    pub async fn read_preview(&self, path: String) -> Result<Vec<u8>, String> {
+        let (reply, rx) = async_channel::bounded(1);
+        self.send(Command::ReadPreview { path, reply }, rx).await
     }
 
     pub async fn write(&self, path: String, data: Vec<u8>) -> Result<(), String> {
@@ -210,6 +216,17 @@ async fn run(session: SftpSession, rx: async_channel::Receiver<Command>) {
                 let result = session.read(path).await.map_err(|e| e.to_string());
                 let _ = reply.send(result).await;
             }
+            Command::ReadPreview { path, reply } => {
+                let result = match session.open(path).await {
+                    Ok(mut file) => {
+                        let result = read_preview_bytes(&mut file).await;
+                        let close_result = file.close().await.map_err(|e| e.to_string());
+                        result.and_then(|bytes| close_result.map(|_| bytes))
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = reply.send(result).await;
+            }
             Command::Write { path, data, reply } => {
                 let result = write_file(&session, path, &data).await;
                 let _ = reply.send(result).await;
@@ -348,7 +365,7 @@ fn reply_error(cmd: Command, message: &str) {
         Command::List { reply, .. } => {
             let _ = reply.send_blocking(Err(message.to_string()));
         }
-        Command::Read { reply, .. } => {
+        Command::Read { reply, .. } | Command::ReadPreview { reply, .. } => {
             let _ = reply.send_blocking(Err(message.to_string()));
         }
         Command::Write { reply, .. }
@@ -364,14 +381,19 @@ fn reply_error(cmd: Command, message: &str) {
     }
 }
 
-/// Största fil vi hämtar hem för förhandsvisning. En SFTP-katalog kan
-/// innehålla flergigabytes-filer, och `read` läser HELA filen till minne
-/// innan något ritas — utan tak skulle ett felklick på en diskavbild
-/// kunna dra ner appen. Bilder som är större än så här är i praktiken
-/// aldrig något man vill ögna igenom över en SSH-länk ändå.
+/// Maximum compressed size for an image preview, enforced while reading.
 pub const PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
-/// Ser filnamnet ut som en bild GTK kan rita? Avgör om en fil öppnas som
+async fn read_preview_bytes(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader.take(PREVIEW_MAX_BYTES + 1).read_to_end(&mut bytes).await.map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > PREVIEW_MAX_BYTES {
+        return Err("Filen är för stor för förhandsvisning".into());
+    }
+    Ok(bytes)
+}
+
+/// Ser filnamnet ut som en bild som kan förhandsvisas? Avgör om en fil öppnas som
 /// förhandsvisning eller i textredigeraren.
 ///
 /// Ändelsebaserat med flit: alternativet vore att hämta hem filen först
@@ -381,10 +403,7 @@ pub const PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// editorn, eftersom en binärfil i en textbuffert är sämre än ett tydligt
 /// felmeddelande.
 pub fn looks_like_image(name: &str) -> bool {
-    // Formaten GdkPixbuf laddar utan extra loaders på en typisk
-    // GNOME-installation. TIFF och ICO ingår, SVG gör det INTE (kräver
-    // librsvg som separat pixbuf-loader — utelämnad hellre än att lova
-    // något som saknas på minimala system).
+    // Formats supported by the bounded preview decoder.
     const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"];
     let Some((_, ext)) = name.rsplit_once('.') else {
         return false;
@@ -399,6 +418,19 @@ pub fn looks_like_image(name: &str) -> bool {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn preview_read_rejects_bytes_beyond_limit_even_without_metadata() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let exact = vec![42; PREVIEW_MAX_BYTES as usize];
+            assert_eq!(read_preview_bytes(&mut exact.as_slice()).await.unwrap().len(), exact.len());
+            let oversized = vec![42; PREVIEW_MAX_BYTES as usize + 32];
+            let mut input = oversized.as_slice();
+            assert!(read_preview_bytes(&mut input).await.is_err());
+            assert_eq!(input.len(), 31);
+        });
+    }
 
     #[test]
     fn recognises_common_image_extensions_case_insensitively() {

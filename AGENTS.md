@@ -33,3 +33,11 @@ The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 - **The fixtures** in `LinuxApp/tests/fixtures/` are copies of the sync format owned by `bastion_apple`.
 - **RSA is disabled** in russh; `docs/rsa-disabled.md` gives the reason and the condition for enabling it.
 - **Extra care:** host key verification, sync format and encryption, OAuth and WebDAV, forwarding and fetched tools.
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:afd164843446f95fddfa903ba9e2dca88a79c17ec21fc8113eebd7c3d8535aab -->
+
+SFTP image previews use a resource-limited helper process, a 25 MiB download limit and a 4096 × 4096 pixel limit. Keep those limits enforced when changing the preview flow.
+
+<!-- /coderabbit-ai-generated:v1 -->

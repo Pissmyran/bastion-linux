@@ -62,3 +62,4 @@ libc = "0.2.191"
 # `v5_12` …) — de kräver ett nyare GtkSourceView än den äldsta distro vi
 # paketerar för kan ha, och inget vi använder behöver dem. Basnivån räcker.
 sourceview5 = { version = "0.11.2", default-features = false }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
