@@ -396,22 +396,19 @@ impl HostStore {
     }
 
     fn import_parsed(&mut self, config: crate::ssh_config::SSHConfig) -> std::io::Result<usize> {
+        self.import_prepared(crate::ssh_config::prepare_import(&config))
+    }
+
+    pub fn import_prepared(&mut self, hosts: Vec<(Host, Option<String>)>) -> std::io::Result<usize> {
         let existing: std::collections::HashSet<String> =
             self.all().iter().map(|h| h.alias.to_lowercase()).collect();
-        let fresh: Vec<Host> = crate::ssh_config::imported_hosts(&config)
-            .into_iter()
-            .filter(|h| !existing.contains(&h.alias.to_lowercase()))
+        let fresh: Vec<_> = hosts.into_iter()
+            .filter(|(h, _)| !existing.contains(&h.alias.to_lowercase()))
             .collect();
         let count = fresh.len();
-        let imported: Vec<(String, Option<String>)> = fresh
-            .iter()
-            .map(|h| {
-                let jump = config.resolve(&h.alias).proxy_jump.as_deref()
-                    .and_then(crate::ssh_config::proxy_jump_alias);
-                (h.alias.clone(), jump)
-            })
-            .collect();
-        for host in fresh {
+        let mut imported = Vec::with_capacity(count);
+        for (host, jump) in fresh {
+            imported.push((host.alias.clone(), jump));
             self.upsert(host)?;
         }
 
