@@ -16,6 +16,8 @@ pub enum Verdict {
     Learned,
     /// Skiljer sig från lagrad nyckel (potentiell MITM eller ombyggd server).
     Changed(String),
+    /// The identity or key cannot be represented safely in the file format.
+    InvalidRecord,
 }
 
 pub struct KnownHosts {
@@ -118,16 +120,28 @@ impl KnownHosts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(e),
         };
-        Ok(text
-            .lines()
-            .filter_map(|line| line.split_once(' '))
-            .map(|(id, key)| (id.to_string(), key.to_string()))
-            .collect())
+        let mut entries = HashMap::new();
+        for (id, key) in text.lines().filter_map(|line| line.split_once(' ')) {
+            if !valid_identity(id) || !valid_key(key) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid known_hosts record"));
+            }
+            if let Some(existing) = entries.get(id) {
+                if existing != key {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "conflicting known_hosts records"));
+                }
+            } else {
+                entries.insert(id.to_string(), key.to_string());
+            }
+        }
+        Ok(entries)
     }
 
     /// Avgör hur en presenterad nyckel förhåller sig till vad vi sett
     /// tidigare. Lär in nyckeln (och persisterar) om värden är ny.
     pub fn check(&self, host: &str, port: u16, key_string: &str) -> Verdict {
+        if !valid_identity(host) || !valid_key(key_string) {
+            return Verdict::InvalidRecord;
+        }
         let id = format!("{host}:{port}");
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
         if let Some(stored) = entries.get(&id) {
@@ -220,6 +234,16 @@ impl KnownHosts {
     }
 }
 
+// Records use a space between identity and key and a newline between entries.
+// Reject delimiters instead of changing the shared format for valid hosts.
+fn valid_identity(id: &str) -> bool {
+    !id.is_empty() && !id.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+fn valid_key(key: &str) -> bool {
+    !key.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +280,55 @@ mod tests {
         }
         let reopened = KnownHosts::open(Some(path.clone())).unwrap();
         assert_eq!(reopened.check("mp100", 22, "ssh-ed25519 AAAAPERSIST"), Verdict::Trusted);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn unsafe_records_cannot_replace_an_existing_pin() {
+        let path = temp_path();
+        let kh = KnownHosts::open(Some(path.clone())).unwrap();
+        assert_eq!(kh.check("victim.example", 22, "ssh-ed25519 original"), Verdict::Learned);
+        let original = std::fs::read(&path).unwrap();
+
+        for host in [
+            "attacker\nvictim.example:22 ssh-ed25519 replacement\nother",
+            "attacker\rvictim",
+            "attacker victim",
+            "attacker\tvictim",
+            "attacker\u{2028}victim",
+            "",
+        ] {
+            assert_eq!(kh.check(host, 22, "ssh-ed25519 attacker"), Verdict::InvalidRecord);
+        }
+        assert_eq!(kh.check("attacker", 22, "ssh-ed25519 x\nvictim.example:22 replacement"), Verdict::InvalidRecord);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(kh.entries().len(), 1);
+
+        let reopened = KnownHosts::open(Some(path.clone())).unwrap();
+        assert_eq!(reopened.check("victim.example", 22, "ssh-ed25519 replacement"), Verdict::Changed("ssh-ed25519 original".into()));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn conflicting_duplicates_fail_closed_but_identical_duplicates_are_safe() {
+        let path = temp_path();
+        std::fs::write(&path, "victim.example:22 ssh-ed25519 original\nvictim.example:22 ssh-ed25519 original\n").unwrap();
+        let kh = KnownHosts::open(Some(path.clone())).unwrap();
+        assert_eq!(kh.check("victim.example", 22, "ssh-ed25519 original"), Verdict::Trusted);
+        drop(kh);
+
+        std::fs::write(&path, "victim.example:22 ssh-ed25519 original\nvictim.example:22 ssh-ed25519 replacement\n").unwrap();
+        assert!(matches!(KnownHosts::open(Some(path.clone())), Err(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn invalid_loaded_records_cannot_be_rewritten_by_forget() {
+        let path = temp_path();
+        for contents in ["bad\tidentity:22 key\n", "host:22 key\rhidden\n"] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(matches!(KnownHosts::open(Some(path.clone())), Err(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        }
         std::fs::remove_file(path).ok();
     }
 

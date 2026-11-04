@@ -109,6 +109,7 @@ pub struct SshSession {
 pub(crate) enum ConnectError {
     Russh(russh::Error),
     HostKeyChanged(String),
+    InvalidKnownHostRecord,
 }
 
 impl From<russh::Error> for ConnectError {
@@ -122,6 +123,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Russh(e) => write!(f, "{e}"),
             ConnectError::HostKeyChanged(msg) => write!(f, "{msg}"),
+            ConnectError::InvalidKnownHostRecord => write!(f, "ogiltigt värdnamn eller värdnyckel för known_hosts"),
         }
     }
 }
@@ -200,6 +202,7 @@ impl client::Handler for ClientHandler {
         );
         match self.known_hosts.check(&self.host, self.port, &key_string) {
             Verdict::Trusted | Verdict::Learned => Ok(true),
+            Verdict::InvalidRecord => Err(ConnectError::InvalidKnownHostRecord),
             Verdict::Changed(stored) => Err(ConnectError::HostKeyChanged(format!(
                 "VÄRDNYCKELN FÖR {}:{} HAR ÄNDRATS — möjlig man-i-mitten-attack eller en \
                  ombyggd server. Lagrad: \"{stored}\" Ny: \"{key_string}\". Om ändringen är \
@@ -1031,6 +1034,26 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn unsafe_hostname_is_rejected_during_host_key_verification() {
+        let known_hosts = Arc::new(KnownHosts::open(None).unwrap());
+        let mut handler = ClientHandler {
+            host: "attacker\nvictim.example:22 ssh-ed25519 replacement\nother".into(),
+            port: 22,
+            known_hosts: known_hosts.clone(),
+            remote_forwards: RemoteForwards::default(),
+        };
+        let key = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAIDqNLHNI/tSXY+pQuTuyCmK68015Ihvn3ntQ62RJ79ZO",
+        ).unwrap().into();
+
+        assert!(matches!(
+            client::Handler::check_server_key(&mut handler, &key).await,
+            Err(ConnectError::InvalidKnownHostRecord)
+        ));
+        assert!(known_hosts.entries().is_empty());
+    }
 
     /// Tre situationer som ser likadana ut för användaren men kräver
     /// helt olika saker. Den mellersta är den som annars är omöjlig att
