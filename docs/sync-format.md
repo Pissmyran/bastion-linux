@@ -1,10 +1,10 @@
 # Sync format
 
-Bastion for Linux reads and writes the same sync format as the other platforms. The **source** of the format is the Swift models in [Bastion for Apple](https://github.com/pissmyran/bastion_apple).
+Bastion for Linux reads and writes the same sync format as the other platforms. The **source** of the format is the Swift models in [Bastion for Apple](https://github.com/Pissmyran/bastion-apple).
 
 ## The fixtures
 
-`LinuxApp/tests/fixtures/` holds copies of the fixtures in [Bastion for Apple](https://github.com/pissmyran/bastion_apple/tree/main/Tests/fixtures). The tests in `host.rs` and `tool_release.rs` read them and show that the Rust side can decode the format.
+`LinuxApp/tests/fixtures/` holds copies of the fixtures in [Bastion for Apple](https://github.com/Pissmyran/bastion-apple/tree/main/Tests/fixtures). The tests in `host.rs` and `tool_release.rs` read them and show that the Rust side can decode the format.
 
 ## When the format changes in Bastion for Apple
 
