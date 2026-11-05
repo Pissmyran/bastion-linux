@@ -1,6 +1,6 @@
 # Issues
 
-GitHub Issues in `pissmyran/bastion_linux` is the repo's issue tracker.
+GitHub Issues in `Pissmyran/bastion-linux` is the repo's issue tracker.
 
 ## Working with issues
 
@@ -12,8 +12,8 @@ GitHub Issues in `pissmyran/bastion_linux` is the repo's issue tracker.
 
 `gh issue` does not work in cloud sessions (GraphQL is disabled). Use REST:
 
-- Read: `gh api repos/pissmyran/bastion_linux/issues/<n>` and `…/issues/<n>/comments`
-- List open: `gh api 'repos/pissmyran/bastion_linux/issues?state=open'`
-- Create: `gh api repos/pissmyran/bastion_linux/issues -f title='…' -f body='…'`
-- Comment: `gh api repos/pissmyran/bastion_linux/issues/<n>/comments -f body='…'`
-- Close: `gh api -X PATCH repos/pissmyran/bastion_linux/issues/<n> -f state=closed`
+- Read: `gh api repos/Pissmyran/bastion-linux/issues/<n>` and `…/issues/<n>/comments`
+- List open: `gh api 'repos/Pissmyran/bastion-linux/issues?state=open'`
+- Create: `gh api repos/Pissmyran/bastion-linux/issues -f title='…' -f body='…'`
+- Comment: `gh api repos/Pissmyran/bastion-linux/issues/<n>/comments -f body='…'`
+- Close: `gh api -X PATCH repos/Pissmyran/bastion-linux/issues/<n> -f state=closed`
