@@ -24,14 +24,14 @@ Not run here: the docs build (`zensical`, only in CI) and `packaging/build-rpm.s
 
 ## Where things live
 
-- `LinuxApp/integrations/` has no dependencies on purpose, so it cannot reach GTK, russh or the filesystem. Keep it that way.
+- `LinuxApp/integrations/` is kept to a single small dependency on purpose, so it cannot reach GTK, russh or the filesystem. Keep it that way.
 - `LinuxApp/src/*_ui.rs` hold the GTK parts of a feature; the matching file without the suffix holds the logic.
 - `.github/release-baseline` and `.github/release-required-checks` steer the release workflow.
 - `docs/agents/` holds issue-tracker and domain notes for agents.
 
 ## Release
 
-Merging to `main` releases automatically. The PR title (Conventional Commits) sets the version; see `docs/release.md`. A release publishes the docs but nothing to a package manager or store. The RPM is built separately.
+Merging to `main` runs the release workflow. The PR title (Conventional Commits) decides whether a release is made and which version; `docs:` titles alone make none (see `docs/release.md`). A stable release publishes the docs but nothing to a package manager or store. The RPM is built separately.
 
 ## Repo-specific rules
 
