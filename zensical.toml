@@ -1,9 +1,9 @@
 [project]
 site_name = "Bastion for Linux"
-site_url = "https://pissmyran.github.io/bastion_linux/"
+site_url = "https://pissmyran.github.io/bastion-linux/"
 site_description = "The SSH client for the Linux desktop, written in Rust with GTK 4 and libadwaita."
-repo_url = "https://github.com/pissmyran/bastion_linux"
-repo_name = "pissmyran/bastion_linux"
+repo_url = "https://github.com/Pissmyran/bastion-linux"
+repo_name = "Pissmyran/bastion-linux"
 edit_uri = "edit/main/docs/"
 docs_dir = "docs"
 site_dir = "site"

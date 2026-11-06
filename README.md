@@ -1,8 +1,8 @@
 # Bastion for Linux
 
-**Documentation:** [pissmyran.github.io/bastion_linux](https://pissmyran.github.io/bastion_linux/)
+**Documentation:** [pissmyran.github.io/bastion-linux](https://pissmyran.github.io/bastion-linux/)
 
-Bastion is an SSH client. This repo holds the version for Linux with GTK 4, built with Rust, GTK 4, libadwaita, VTE and russh. The other platforms have their own repos: [Bastion for Apple](https://github.com/pissmyran/bastion_apple), [Bastion for Windows](https://github.com/pissmyran/bastion_windows), [Bastion for Android](https://github.com/pissmyran/bastion_android). The [Bastion hub](https://github.com/pissmyran/bastion) ties them together.
+Bastion is an SSH client. This repo holds the version for Linux with GTK 4, built with Rust, GTK 4, libadwaita, VTE and russh. The other platforms have their own repos: [Bastion for Apple](https://github.com/Pissmyran/bastion-apple), [Bastion for Windows](https://github.com/Pissmyran/bastion-windows), [Bastion for Android](https://github.com/Pissmyran/bastion-android). The [Bastion hub](https://github.com/Pissmyran/bastion) ties them together.
 
 ## Contents
 
@@ -37,6 +37,6 @@ cd LinuxApp && cargo run
 
 ## More
 
-- [The documentation](https://pissmyran.github.io/bastion_linux/): getting started, architecture, operations, sync format and releases
+- [The documentation](https://pissmyran.github.io/bastion-linux/): getting started, architecture, operations, sync format and releases
 - [SECURITY.md](SECURITY.md): report a vulnerability
 - [CONTRIBUTING.md](CONTRIBUTING.md): contribute
