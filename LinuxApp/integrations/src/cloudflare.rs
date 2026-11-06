@@ -22,6 +22,8 @@
 //! ut. Skillnaden syns bara på antalet aktiva anslutningar, och det är
 //! därför den och inte tunnelns existens som avgör om raden ser frisk ut.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 /// En tunnel som kontot känner till.
@@ -49,13 +51,14 @@ impl Tunnel {
     /// colos. Att lista `ARN, ARN, HEL, HEL` vore brus; två namn säger
     /// samma sak.
     pub fn colos(&self) -> Vec<String> {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut colos = Vec::new();
         for c in &self.connections {
-            if !c.colo.is_empty() && !seen.contains(&c.colo) {
-                seen.push(c.colo.clone());
+            if !c.colo.is_empty() && seen.insert(c.colo.as_str()) {
+                colos.push(c.colo.clone());
             }
         }
-        seen
+        colos
     }
 }
 
@@ -219,6 +222,23 @@ mod tests {
         let tunnels = parse_tunnels(TUNNELS);
         assert_eq!(tunnels[0].colos(), vec!["ARN", "HEL"]);
         assert!(tunnels[1].colos().is_empty());
+    }
+
+    #[test]
+    fn many_distinct_colos_keep_first_occurrence_order() {
+        let mut output = String::from(r#"[{"name":"t","connections":[{"colo_name":""},"#);
+        for i in 0..100_000 {
+            output.push_str(&format!(r#"{{"colo_name":"colo{i}"}},"#));
+        }
+        output.push_str(r#"{"colo_name":"colo0"},{"colo_name":"colo99999"}]}]"#);
+        assert!(output.len() < 4 * 1024 * 1024);
+
+        let tunnels = parse_tunnels(&output);
+        let colos = tunnels[0].colos();
+        assert_eq!(colos.len(), 100_000);
+        for (i, colo) in colos.iter().enumerate() {
+            assert_eq!(colo, &format!("colo{i}"));
+        }
     }
 
     /// Äldre utdata saknar `connections`. Posten ska bli en tunnel som är
