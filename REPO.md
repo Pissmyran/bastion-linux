@@ -20,7 +20,7 @@ Build works:
 cargo build
 ```
 
-Tests are the only gate and run before every push:
+Tests are the only test gate and run before every push:
 
 ```bash
 cargo test --workspace
@@ -53,5 +53,5 @@ Merging to `main` runs the release workflow. It calculates the release from the 
 
 ## Repo-specific rules
 
-- No CI job builds or tests the app, so the local test run is the only gate.
+- No CI job builds or tests the app, so the local test run is the only test gate.
 - `rust-version` in `LinuxApp/Cargo.toml` is a verified floor; raise it only after rerunning the tests on that toolchain.
