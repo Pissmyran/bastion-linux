@@ -1,8 +1,8 @@
-# AGENTS.md – bastion_linux
+# AGENTS.md – bastion-linux
 
 Bastion for Linux: the SSH client for Linux, built with Rust, GTK 4, libadwaita, VTE and russh.
 
-Read the shared rules at the start of every session: [GOVERNANCE.md](https://raw.githubusercontent.com/pissmyran/.github/main/GOVERNANCE.md) and [BASTION.md](https://raw.githubusercontent.com/pissmyran/.github/main/BASTION.md).
+Read the shared rules at the start of every session: [GOVERNANCE.md](https://raw.githubusercontent.com/Pissmyran/.github/main/GOVERNANCE.md) and [BASTION.md](https://raw.githubusercontent.com/Pissmyran/.github/main/BASTION.md).
 
 ## Read first
 
@@ -30,6 +30,6 @@ The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 ## Rules
 
 - **The GTK packages above must be installed** for `cargo test` to compile.
-- **The fixtures** in `LinuxApp/tests/fixtures/` are copies of the sync format owned by `bastion_apple`.
+- **The fixtures** in `LinuxApp/tests/fixtures/` are copies of the sync format owned by `bastion-apple`.
 - **RSA is disabled** in russh; `docs/rsa-disabled.md` gives the reason and the condition for enabling it.
 - **Extra care:** host key verification, sync format and encryption, OAuth and WebDAV, forwarding and fetched tools.

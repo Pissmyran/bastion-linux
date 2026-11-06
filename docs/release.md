@@ -21,7 +21,7 @@ The PR title becomes the commit on `main` and follows Conventional Commits. The 
 2. `.github/workflows/release.yml` computes the version from the commits since the latest tag, or since the commit in `.github/release-baseline` if there is no tag yet.
 3. The release waits until the checks in `.github/release-required-checks` are green on the same commit.
 4. The tag and the GitHub Release are created.
-5. The documentation is built from the tag and published on [GitHub Pages](https://pissmyran.github.io/bastion_linux/).
+5. The documentation is built from the tag and published on [GitHub Pages](https://pissmyran.github.io/bastion-linux/).
 
 A merge that only contains, for example, `docs:` releases no new version, so the documentation is published at the next release.
 

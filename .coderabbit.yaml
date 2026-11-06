@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
-# Shared base: pissmyran/coderabbit; keep shared settings there.
+# Shared base: Pissmyran/coderabbit; keep shared settings there.
 inheritance: true
 
 reviews:
@@ -75,7 +75,7 @@ reviews:
     # Persistent format and merging.
     - path: "{LinuxApp/src/{host,snippet,sync,fsutil}.rs,LinuxApp/tests/fixtures/{host-wire-format,sync-state-wire-format}.json}"
       instructions: |
-        The format is owned by bastion_apple; follow docs/sync-format.md.
+        The format is owned by bastion-apple; follow docs/sync-format.md.
         Fixtures are copies of the Apple fixtures, not a Linux-only contract.
         When serialization or storage changes, compare field names,
         UUID encoding, the 2001-01-01 date epoch and the tombstone format
