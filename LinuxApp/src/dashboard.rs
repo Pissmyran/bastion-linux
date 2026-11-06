@@ -154,19 +154,26 @@ impl SystemSnapshot {
 /// Delar `output` i `@@SEKTION`-block, precis som Swift-sidans `parse` —
 /// sektionsmarkörer skiljer de sammanslagna kommandonas utdata åt eftersom
 /// allt kommer tillbaka i EN sträng från en enda round-trip.
-fn sections(output: &str) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut current = String::new();
+fn sections(output: &str) -> std::collections::HashMap<&str, Vec<String>> {
+    let mut map: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    let mut current: Option<&mut Vec<String>> = None;
     // `filter(!is_empty)` motsvarar Swifts `split(whereSeparator:)`, som
     // (till skillnad från Rusts `str::split`) utelämnar tomma delsträngar
     // som standard — annars hade en avslutande radbrytning gett en
     // spöklinje i den sist öppnade sektionen.
     for line in output.split(['\n', '\r']).filter(|l| !l.is_empty()) {
         if let Some(name) = line.strip_prefix("@@") {
-            current = name.to_string();
-            map.entry(current.clone()).or_default();
-        } else if !current.is_empty() {
-            map.entry(current.clone()).or_default().push(line.to_string());
+            // Only retain sections the parser consumes. Select their buffer once,
+            // so an untrusted marker is never copied or hashed for every line.
+            current = match name {
+                "LOADAVG" | "UPTIME" | "MEM" | "DF" | "OS" | "KERNEL" | "HOST" | "NPROC"
+                | "DOCKER" | "TEMP" | "IP" | "IPFALLBACK" | "KEYS" | "WHO" => {
+                    Some(map.entry(name).or_default())
+                }
+                _ => None,
+            };
+        } else if let Some(lines) = &mut current {
+            lines.push(line.to_string());
         }
     }
     map
@@ -492,6 +499,37 @@ f6e5d4c3b2a1|radarr|linuxserver/radarr|Up 2 hours (healthy)\n\
         assert_eq!(s.load, None);
         assert_eq!(s.memory, None);
         assert!(s.disks.is_empty());
+    }
+
+    #[test]
+    fn unknown_markers_discard_lines_until_a_known_section_resumes() {
+        let long_name = "x".repeat(1024 * 1024);
+        let output = format!(
+            "before\r\n@@HOST\r\nfirst\r\n@@{long_name}\n{}@@HOST\nsecond\n@@\nignored\n@@END\nignored\n@@NPROC\n4\n",
+            "x\n".repeat(10_000)
+        );
+        let collected = sections(&output);
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected["HOST"], ["first", "second"]);
+        assert_eq!(collected["NPROC"], ["4"]);
+
+        let snapshot = parse(&output);
+        assert_eq!(snapshot.hostname.as_deref(), Some("first"));
+        assert_eq!(snapshot.cpu_count, Some(4));
+    }
+
+    #[test]
+    fn every_probe_section_is_collected() {
+        let names = [
+            "LOADAVG", "UPTIME", "MEM", "DF", "OS", "KERNEL", "HOST", "NPROC", "DOCKER",
+            "TEMP", "IP", "IPFALLBACK", "KEYS", "WHO",
+        ];
+        let output: String = names.iter().map(|name| format!("@@{name}\nvalue\n")).collect();
+        let collected = sections(&output);
+        for name in names {
+            assert!(COMMAND.contains(&format!("@@{name};")), "missing probe marker {name}");
+            assert_eq!(collected[name], ["value"]);
+        }
     }
 
     #[test]
