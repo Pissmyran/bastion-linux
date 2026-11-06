@@ -14,10 +14,28 @@ A native SSH client for the Linux desktop: a Rust GTK application plus separate 
 
 Run from `LinuxApp/` (the build dependencies in AGENTS.md must be installed):
 
+Build works:
+
 ```bash
-cargo build              # works
-cargo clippy --workspace # runs, but currently reports warnings; not a gate
-cargo fmt --check        # runs, but the tree is not formatted; not a gate
+cargo build
+```
+
+Tests are the only gate and run before every push:
+
+```bash
+cargo test --workspace
+```
+
+Clippy runs but currently reports warnings; not a gate:
+
+```bash
+cargo clippy --workspace
+```
+
+The tree is not formatted, so this reports diffs; not a gate:
+
+```bash
+cargo fmt --check
 ```
 
 Not run here: the docs build (`zensical`, only in CI) and `packaging/build-rpm.sh` (needs a Fedora container).
@@ -31,7 +49,7 @@ Not run here: the docs build (`zensical`, only in CI) and `packaging/build-rpm.s
 
 ## Release
 
-Merging to `main` runs the release workflow. The PR title (Conventional Commits) decides whether a release is made and which version; `docs:` titles alone make none (see `docs/release.md`). A stable release publishes the docs but nothing to a package manager or store. The RPM is built separately.
+Merging to `main` runs the release workflow. It calculates the release from the first-parent commits since the latest reachable stable tag, or since `.github/release-baseline` when no stable tag exists. A `docs:` merge with no pending release-worthy commits makes no release, but it can release an earlier pending change if a previous release failed before its tag was created (see `docs/release.md`). A stable release publishes the docs but nothing to a package manager or store. The RPM is built separately.
 
 ## Repo-specific rules
 
