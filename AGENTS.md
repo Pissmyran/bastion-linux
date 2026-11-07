@@ -12,7 +12,7 @@ Workflow
 
 Git and review
 - Squash merge, signed commits, auto-merge on.
-- A review conversation is resolved only after the comment is read in full and the flagged code is analyzed and fixed.
+- A review conversation is resolved only after the comment is read in full and the flagged code is analyzed. A confirmed defect is fixed before resolving.
 - Nothing personal in code or docs. Generic placeholders only.
 
 Reporting and context
