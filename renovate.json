@@ -22,7 +22,9 @@
     "schedule": ["* 0-6 * * 1"]
   },
   "osvVulnerabilityAlerts": true,
-  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "dependencyDashboard": {
+    "osvVulnerabilitySummary": "unresolved"
+  },
   "vulnerabilityAlerts": {
     "labels": ["dependencies", "security"],
     "automerge": true,
