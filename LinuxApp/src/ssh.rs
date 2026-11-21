@@ -109,6 +109,7 @@ pub struct SshSession {
 pub(crate) enum ConnectError {
     Russh(russh::Error),
     HostKeyChanged(String),
+    KnownHosts(std::io::Error),
 }
 
 impl From<russh::Error> for ConnectError {
@@ -122,6 +123,9 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Russh(e) => write!(f, "{e}"),
             ConnectError::HostKeyChanged(msg) => write!(f, "{msg}"),
+            ConnectError::KnownHosts(e) => {
+                write!(f, "kunde inte kontrollera eller spara known_hosts: {e}")
+            }
         }
     }
 }
@@ -198,7 +202,8 @@ impl client::Handler for ClientHandler {
             server_public_key.algorithm().as_str(),
             server_public_key.public_key_base64()
         );
-        match self.known_hosts.check(&self.host, self.port, &key_string) {
+        match self.known_hosts.check(&self.host, self.port, &key_string)
+            .map_err(ConnectError::KnownHosts)? {
             Verdict::Trusted | Verdict::Learned => Ok(true),
             Verdict::Changed(stored) => Err(ConnectError::HostKeyChanged(format!(
                 "VÄRDNYCKELN FÖR {}:{} HAR ÄNDRATS — möjlig man-i-mitten-attack eller en \
@@ -1031,6 +1036,30 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn server_key_check_uses_current_store_and_rejects_storage_errors() {
+        use russh::client::Handler;
+        let dir = std::env::temp_dir().join(format!("bastion-host-key-check-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let known = Arc::new(KnownHosts::open(Some(path.clone())).unwrap());
+        let mut handler = ClientHandler {
+            host: "example.com".into(),
+            port: 22,
+            known_hosts: known,
+            remote_forwards: RemoteForwards::default(),
+        };
+        let key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDqNLHNI/tSXY+pQuTuyCmK68015Ihvn3ntQ62RJ79ZO",
+        ).unwrap().into();
+        std::fs::write(&path, "example.com:22 old-key\n").unwrap();
+        assert!(matches!(handler.check_server_key(&key).await, Err(ConnectError::HostKeyChanged(_))));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(handler.check_server_key(&key).await, Err(ConnectError::KnownHosts(_))));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Tre situationer som ser likadana ut för användaren men kräver
     /// helt olika saker. Den mellersta är den som annars är omöjlig att
