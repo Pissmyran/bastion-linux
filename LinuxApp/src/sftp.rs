@@ -11,6 +11,10 @@
 use crate::host::Host;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
+use std::ffi::{CStr, CString, OsStr, OsString};
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -133,25 +137,99 @@ impl SftpHandle {
 /// redan"-statuskod förrän v6) — om katalogen redan finns fortsätter
 /// uppladdningen ändå in i den; ett EKTA behörighetsfel avslöjas istället
 /// av den efterföljande skrivningen, som INTE ignoreras.
+/// Child symlinks are skipped; a symlink selected as the root is rejected.
 pub fn upload_path_recursive<'a>(
     handle: &'a SftpHandle,
     local_path: &'a std::path::Path,
     remote_path: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>> {
     Box::pin(async move {
-        if local_path.is_dir() {
+        let name = local_path.file_name().ok_or("Ogiltig lokal sökväg")?;
+        let parent = local_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        let parent = std::fs::File::open(parent).map_err(|e| e.to_string())?;
+        let root = open_upload_child(&parent, name).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                "Symboliska länkar kan inte laddas upp".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        upload_open_file(handle, root, remote_path).await
+    })
+}
+
+// Each name is a single directory entry, opened relative to a retained parent
+// descriptor. Checking a pathname before opening it would allow link swaps.
+fn open_upload_child(parent: &std::fs::File, name: &OsStr) -> std::io::Result<std::fs::File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: parent is open and name is a NUL-terminated, single component.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor owned by this File.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn upload_directory_names(dir: &std::fs::File) -> std::io::Result<Vec<OsString>> {
+    // fdopendir owns its descriptor; duplicate it to retain the parent for openat.
+    let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    struct DirStream(*mut libc::DIR);
+    impl Drop for DirStream {
+        fn drop(&mut self) { unsafe { libc::closedir(self.0) }; }
+    }
+    let stream = DirStream(stream);
+    let mut names = Vec::new();
+    loop {
+        // readdir leaves errno unchanged at end of stream.
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(0) { Ok(names) } else { Err(error) };
+        }
+        // SAFETY: readdir returned a valid entry, whose name is NUL-terminated.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+    }
+}
+
+fn upload_open_file<'a>(
+    handle: &'a SftpHandle,
+    mut local: std::fs::File,
+    remote_path: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>> {
+    Box::pin(async move {
+        let file_type = local.metadata().map_err(|e| e.to_string())?.file_type();
+        if file_type.is_dir() {
             let _ = handle.mkdir(remote_path.to_string()).await;
-            let entries = std::fs::read_dir(local_path).map_err(|e| e.to_string())?;
-            for entry in entries {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let child_remote = if remote_path == "." { name.clone() } else { format!("{remote_path}/{name}") };
-                upload_path_recursive(handle, &entry.path(), &child_remote).await?;
+            for name in upload_directory_names(&local).map_err(|e| e.to_string())? {
+                let child = match open_upload_child(&local, &name) {
+                    Ok(child) => child,
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+                    Err(e) => return Err(e.to_string()),
+                };
+                let child_remote = joined_path(remote_path, &name.to_string_lossy());
+                upload_open_file(handle, child, &child_remote).await?;
             }
             Ok(())
-        } else {
-            let data = std::fs::read(local_path).map_err(|e| e.to_string())?;
+        } else if file_type.is_file() {
+            let mut data = Vec::new();
+            local.read_to_end(&mut data).map_err(|e| e.to_string())?;
             handle.write(remote_path.to_string(), data).await
+        } else {
+            Err("Kan bara ladda upp vanliga filer och kataloger".to_string())
         }
     })
 }
@@ -427,6 +505,76 @@ mod preview_tests {
 mod tests {
     use super::*;
     use crate::host::{Host, HostAuth};
+
+    #[test]
+    fn upload_skips_symlinks_without_reading_targets() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!("bastion-upload-links-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(root.join("nested/ok"), b"safe").unwrap();
+        std::fs::write(dir.join("outside/secret"), b"secret").unwrap();
+        symlink(dir.join("outside/secret"), root.join("file-link")).unwrap();
+        symlink(dir.join("outside"), root.join("dir-link")).unwrap();
+        symlink("nested/ok", root.join("internal-link")).unwrap();
+        symlink("missing", root.join("broken-link")).unwrap();
+        symlink("..", root.join("nested/cycle")).unwrap();
+        symlink(&root, dir.join("root-link")).unwrap();
+
+        let (tx, rx) = async_channel::unbounded();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = writes.clone();
+        let server = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv_blocking() {
+                match cmd {
+                    Command::Mkdir { reply, .. } => { reply.send_blocking(Ok(())).unwrap(); }
+                    Command::Write { path, data, reply } => {
+                        recorded.lock().unwrap().push((path, data));
+                        reply.send_blocking(Ok(())).unwrap();
+                    }
+                    _ => panic!("unexpected SFTP command"),
+                }
+            }
+        });
+        let handle = SftpHandle { tx };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            upload_path_recursive(&handle, &root, "remote").await.unwrap();
+            upload_path_recursive(&handle, &root.join("nested/ok"), "single").await.unwrap();
+            assert!(upload_path_recursive(&handle, &dir.join("root-link/"), "link").await.is_err());
+        });
+        drop(handle);
+        server.join().unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec![
+            ("remote/nested/ok".to_string(), b"safe".to_vec()),
+            ("single".to_string(), b"safe".to_vec()),
+        ]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn upload_keeps_open_directory_when_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("bastion-upload-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("selected/subdir")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("selected/subdir/file"), b"safe").unwrap();
+        std::fs::write(dir.join("outside/file"), b"secret").unwrap();
+        let parent = std::fs::File::open(dir.join("selected")).unwrap();
+        let child = open_upload_child(&parent, OsStr::new("subdir")).unwrap();
+        std::fs::rename(dir.join("selected/subdir"), dir.join("moved")).unwrap();
+        symlink(dir.join("outside"), dir.join("selected/subdir")).unwrap();
+        assert_eq!(open_upload_child(&parent, OsStr::new("subdir")).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        let mut file = open_upload_child(&child, OsStr::new("file")).unwrap();
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"safe");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Riktig end-to-end-övning mot localhosts sshd: mkdir/write/read/list/
     /// rename/remove i en engångsmapp under /tmp — skapar och tar bort sin

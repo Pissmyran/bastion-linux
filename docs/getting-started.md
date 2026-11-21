@@ -26,6 +26,14 @@ cd LinuxApp && cargo run
 
 `openssh-client` is needed because the key import tests run `ssh-keygen`. The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:ab7b32a01ba93f9a30d3380c3b5a14b4269b263ed331216b51172eac07bfcc2e -->
+
+SFTP directory uploads skip symbolic links; a symbolic link selected as the upload root is rejected.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 ## Contents
 
 | Path | Contents |

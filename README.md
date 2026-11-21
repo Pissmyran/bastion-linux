@@ -13,6 +13,14 @@ Bastion is an SSH client. This repo holds the version for Linux with GTK 4, buil
 | `LinuxApp/tests/fixtures/` | Copies of the sync-format fixtures from Bastion for Apple |
 | `LinuxApp/packaging/` | Desktop file and RPM build |
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:ab7b32a01ba93f9a30d3380c3b5a14b4269b263ed331216b51172eac07bfcc2e -->
+
+SFTP directory uploads skip symbolic links; a symbolic link selected as the upload root is rejected.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 ## Getting started
 
 Install build dependencies (Debian and Ubuntu):

@@ -27,6 +27,14 @@ cd LinuxApp && cargo run
 
 The RPM package is built with `LinuxApp/packaging/build-rpm.sh`.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cf7c6384f22e7cce08171419c2264772776e20717dc509ec73159cf23d7065e6 -->
+
+SFTP uploads skip child symbolic links and reject a symbolic link selected as the root.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 ## Rules
 
 - **The GTK packages above must be installed** for `cargo test` to compile.
