@@ -49,23 +49,13 @@ pub struct WebDavSyncProvider {
 /// utan att sätta upp TLS — men det är också det enda fall där det är
 /// ofarligt.
 pub fn credentials_may_be_sent(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return true;
-    }
-    if let Some(rest) = lower.strip_prefix("http://") {
-        // En IPv6-litteral står inom hakparenteser och innehåller
-        // KOLON — att dela på `:` styckar sönder `[::1]` och ger `[`.
-        // Den formen måste alltså plockas ut för sig innan portens
-        // avgränsare får någon betydelse.
-        let host = if let Some(end) = rest.find(']') {
-            if rest.starts_with('[') { &rest[..=end] } else { "" }
-        } else {
-            rest.split(['/', ':', '?', '#']).next().unwrap_or("")
-        };
-        return matches!(host, "127.0.0.1" | "localhost" | "[::1]");
-    }
-    false
+    reqwest::Url::parse(url).is_ok_and(|url| transport_is_allowed(&url))
+}
+
+fn transport_is_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")))
 }
 
 /// Vad som gick fel, i den detalj som går att åtgärda.
@@ -146,6 +136,14 @@ impl WebDavSyncProvider {
 
     fn client() -> Result<reqwest::Client, WebDavError> {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if !transport_is_allowed(attempt.url()) {
+                    attempt.error("insecure WebDAV redirect")
+                } else {
+                    // Preserve reqwest's default redirect limit.
+                    reqwest::redirect::Policy::default().redirect(attempt)
+                }
+            }))
             // En synk som hänger blockerar hela sparflödet. Trettio
             // sekunder räcker för en trög hemmaserver och är kort nog att
             // inte se ut som att appen frusit.
@@ -280,6 +278,9 @@ mod tests {
         assert!(!credentials_may_be_sent("http://192.168.1.10/b.json"), "LAN är inte loopback");
         assert!(!credentials_may_be_sent("http://127.0.0.1.evil.example/b.json"),
                 "ett värdnamn som BÖRJAR med 127.0.0.1 är inte loopback");
+        assert!(!credentials_may_be_sent("http://localhost:1234@example.com/b.json"));
+        assert!(!credentials_may_be_sent("http://127.0.0.1:1234@example.com/b.json"));
+        assert!(!credentials_may_be_sent("https://"));
         assert!(!credentials_may_be_sent("ftp://moln.example/b.json"));
         assert!(!credentials_may_be_sent(""));
     }
@@ -287,18 +288,16 @@ mod tests {
     /// Kontrollen ska ske FÖRE anropet, så inget skickas ens en gång.
     #[test]
     fn an_insecure_url_fails_before_anything_is_sent() {
-        let (user, password) = generated_credentials();
-        let provider = WebDavSyncProvider::new(
-            "http://moln.example/dav/b.json".into(),
-            user,
-            password,
-        );
-        let pull = provider.pull().expect_err("http skulle avvisats");
-        assert_eq!(pull.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(pull.to_string().contains("https://"), "felet ska säga vad som krävs");
+        for url in ["http://moln.example/dav/b.json", "http://localhost:1234@example.com/b.json"] {
+            let (user, password) = generated_credentials();
+            let provider = WebDavSyncProvider::new(url.into(), user, password);
+            let pull = provider.pull().expect_err("http skulle avvisats");
+            assert_eq!(pull.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(pull.to_string().contains("https://"), "felet ska säga vad som krävs");
 
-        let push = provider.push(&SyncState::default()).expect_err("http skulle avvisats");
-        assert_eq!(push.kind(), std::io::ErrorKind::InvalidInput);
+            let push = provider.push(&SyncState::default()).expect_err("http skulle avvisats");
+            assert_eq!(push.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     /// Felen ska gå att skilja åt i gränssnittet — ett nätverksfel och ett
@@ -327,6 +326,94 @@ mod tests {
             format!("user-{}", uuid::Uuid::new_v4()),
             format!("pw-{}", uuid::Uuid::new_v4()),
         )
+    }
+
+    // Exercise both methods through a permitted first redirect, followed by
+    // either a permitted response or an insecure destination. The body must
+    // survive a permitted 307/308, but never be sent to the insecure URL.
+    #[test]
+    fn redirects_recheck_transport_for_get_and_put() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        for status in [307, 308] {
+            for insecure in [false, true] {
+                for push in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    listener.set_nonblocking(true).unwrap();
+                    // 127.0.0.2 is reachable locally but is outside the
+                    // explicitly permitted HTTP hosts.
+                    let sink = TcpListener::bind("127.0.0.2:0").unwrap();
+                    let sink_port = sink.local_addr().unwrap().port();
+                    sink.set_nonblocking(true).unwrap();
+                    let server = std::thread::spawn(move || {
+                        let mut requests = Vec::new();
+                        for index in 0..2 {
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            let mut stream = loop {
+                                match listener.accept() {
+                                    Ok((stream, _)) => break stream,
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                                        && std::time::Instant::now() < deadline => {
+                                        std::thread::sleep(std::time::Duration::from_millis(10));
+                                    }
+                                    Err(e) => panic!("server accept failed: {e}"),
+                                }
+                            };
+                            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                            let mut request = Vec::new();
+                            let mut buffer = [0; 4096];
+                            loop {
+                                let n = stream.read(&mut buffer).unwrap();
+                                assert_ne!(n, 0);
+                                request.extend_from_slice(&buffer[..n]);
+                                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let headers = String::from_utf8_lossy(&request[..end]);
+                                    let length = headers.lines().find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().unwrap())
+                                    }).unwrap_or(0);
+                                    if request.len() >= end + 4 + length { break; }
+                                }
+                            }
+                            requests.push(String::from_utf8(request).unwrap());
+                            let response = if index == 0 {
+                                format!("HTTP/1.1 {status} Redirect\r\nLocation: /second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            } else if insecure {
+                                format!("HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.2:{sink_port}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            } else {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                            };
+                            stream.write_all(response.as_bytes()).unwrap();
+                        }
+                        requests
+                    });
+
+                    let (user, password) = generated_credentials();
+                    let provider = WebDavSyncProvider::new(format!("http://127.0.0.1:{port}/first"), user, password);
+                    let result = if push {
+                        provider.push(&SyncState::default())
+                    } else {
+                        provider.pull().map(|_| ())
+                    };
+                    let requests = server.join().unwrap();
+                    assert!(requests[0].starts_with(if push { "PUT /first " } else { "GET /first " }));
+                    assert!(requests[1].starts_with(if push { "PUT /second " } else { "GET /second " }));
+                    if push {
+                        assert!(requests[0].contains("\"hosts\""));
+                        assert_eq!(requests[0].split("\r\n\r\n").nth(1), requests[1].split("\r\n\r\n").nth(1));
+                    }
+                    if insecure {
+                        assert!(result.unwrap_err().to_string().contains("redirect"));
+                        assert!(matches!(sink.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+                    } else {
+                        result.unwrap();
+                    }
+                }
+            }
+        }
     }
 
     /// End-to-end mot en RIKTIG HTTP-server som talar det WebDAV faktiskt
