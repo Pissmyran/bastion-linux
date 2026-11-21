@@ -57,6 +57,7 @@ pub fn import_existing(pem: &str, comment: &str) -> Result<GeneratedKeyPair, Str
 }
 
 fn key_pair_to_generated(keypair: PrivateKey, comment: &str) -> Result<GeneratedKeyPair, String> {
+    validate_single_line(comment)?;
     let public_key = keypair.public_key();
     let mut public_key_line =
         format!("{} {}", public_key.algorithm().as_str(), public_key.public_key_base64());
@@ -70,6 +71,13 @@ fn key_pair_to_generated(keypair: PrivateKey, comment: &str) -> Result<Generated
     let private_key_pem = String::from_utf8(pem_bytes).map_err(|e| e.to_string())?;
 
     Ok(GeneratedKeyPair { public_key_line, private_key_pem })
+}
+
+fn validate_single_line(value: &str) -> Result<(), String> {
+    if value.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err("nyckelraden får inte innehålla radbrytningar eller NUL".to_string());
+    }
+    Ok(())
 }
 
 /// Skriver PEM-materialet till en ny fil under `~/.bastion/keys/` med 0600 —
@@ -120,7 +128,7 @@ fn deploy_command_at(public_key_line: &str, path: &str) -> String {
     format!(
         "mkdir -p {dir} && chmod 700 {dir} && touch {path} && \
          chmod 600 {path} && \
-         (grep -qxF {quoted} {path} || echo {quoted} >> {path})"
+         (grep -qxF {quoted} {path} || printf '%s\\n' {quoted} >> {path})"
     )
 }
 
@@ -232,6 +240,7 @@ async fn deploy_and_verify(
     authorized_keys_path_override: Option<&str>,
     jump: Option<Host>,
 ) -> Result<(), String> {
+    validate_single_line(&public_key_line)?;
     let command = match authorized_keys_path_override {
         Some(path) => deploy_command_at(&public_key_line, path),
         None => deploy_command_for_host(&host, &public_key_line),
@@ -323,6 +332,15 @@ mod tests {
         assert_ne!(a.public_key_line, b.public_key_line);
     }
 
+    #[test]
+    fn generated_and_imported_keys_reject_record_separators() {
+        let pem = generate_ed25519("").unwrap().private_key_pem;
+        for comment in ["bad\nssh-ed25519 attacker", "bad\rssh-ed25519 attacker", "bad\0comment"] {
+            assert!(generate_ed25519(comment).is_err());
+            assert!(import_existing(&pem, comment).is_err());
+        }
+    }
+
     /// Genererar en RIKTIG OpenSSH Ed25519-nyckel via `ssh-keygen` (inte en
     /// handkonstruerad sträng) och "klistrar in" dess PEM-text — bevisar att
     /// `import_existing` faktiskt kan tolka en nyckel skapad av ett annat
@@ -405,6 +423,37 @@ mod tests {
         assert!(cmd.contains("grep -qxF"), "ska kolla om raden redan finns innan den lägger till den");
         // Enkelcitatet i kommentaren ska vara escapat, inte avslutat kommandot i förtid.
         assert!(cmd.contains("it'\\''s-a-comment"));
+    }
+
+    #[test]
+    fn posix_deployment_preserves_backslashes_and_writes_one_record() {
+        let pair = generate_ed25519(r"comment'\nssh-ed25519 attacker\c %s").unwrap();
+        let dir = std::env::temp_dir().join(format!("bastion-deploy-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("authorized_keys");
+        let command = deploy_command_at(&pair.public_key_line, path.to_str().unwrap());
+
+        for shell in ["sh", "dash"] {
+            for _ in 0..2 {
+                let status = match std::process::Command::new(shell).args(["-c", &command]).status() {
+                    Ok(status) => status,
+                    Err(e) if shell == "dash" && e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => panic!("could not start {shell}: {e}"),
+                };
+                assert!(status.success());
+                assert_eq!(std::fs::read(&path).unwrap(), format!("{}\n", pair.public_key_line).as_bytes());
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_rejects_multiline_records_before_connecting() {
+        let host = Host::new("test".into(), "invalid".into(), "test".into());
+        for separator in ['\n', '\r', '\0'] {
+            let line = format!("ssh-ed25519 AAAA comment{separator}ssh-ed25519 attacker");
+            let result = deploy_and_verify(host.clone(), None, line, String::new(), None, None).await;
+            assert_eq!(result, Err("nyckelraden får inte innehålla radbrytningar eller NUL".to_string()));
+        }
     }
 
     /// Avkodar en `powershell -EncodedCommand`-sträng tillbaka till klartext
