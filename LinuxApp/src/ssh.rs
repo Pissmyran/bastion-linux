@@ -137,6 +137,7 @@ pub(crate) struct ClientHandler {
     port: u16,
     known_hosts: Arc<KnownHosts>,
     remote_forwards: RemoteForwards,
+    forward_agent: bool,
 }
 
 impl client::Handler for ClientHandler {
@@ -156,6 +157,8 @@ impl client::Handler for ClientHandler {
     /// ROADMAP dokumenterar som arkitektoniskt blockerat. Den slutsatsen
     /// gäller NIOSSH, inte russh, och därför finns funktionen här.
     ///
+    /// Only hosts with forwarding enabled may open an agent channel.
+    ///
     /// Saknas `$SSH_AUTH_SOCK` accepteras kanalen ändå och stängs direkt.
     /// Alternativet vore att avvisa den, men då får fjärrsidan ett
     /// protokollfel i stället för ett tomt svar — och en `ssh-add -l` som
@@ -166,6 +169,10 @@ impl client::Handler for ClientHandler {
         reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
+        if !self.forward_agent {
+            reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+            return Ok(());
+        }
         reply.accept().await;
         let socket = std::env::var("SSH_AUTH_SOCK").ok();
         tokio::spawn(async move {
@@ -399,6 +406,7 @@ pub(crate) async fn connect_with_forwards(
         port: host.port as u16,
         known_hosts,
         remote_forwards,
+        forward_agent: host.forward_agent,
     };
 
     let mut session: Handle<ClientHandler> = match jump {
@@ -515,6 +523,7 @@ async fn connect_via_jump(
         port: jump_host.port as u16,
         known_hosts: jump_known_hosts,
         remote_forwards: RemoteForwards::default(),
+        forward_agent: jump_host.forward_agent,
     };
     let mut jump_session = connect_direct(jump_host, jump_handler)
         .await
@@ -1031,6 +1040,209 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use std::time::Duration;
+
+    struct AgentTestServer {
+        handle: Option<tokio::sync::oneshot::Sender<russh::server::Handle>>,
+    }
+
+    impl russh::server::Handler for AgentTestServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _key: russh::server::VerifiedPublicKey<'_>,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn auth_succeeded(
+            &mut self,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(sender) = self.handle.take() {
+                let _ = sender.send(session.handle());
+            }
+            Ok(())
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<russh::server::Msg>,
+            host: &str,
+            port: u32,
+            _originator: &str,
+            _originator_port: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let mut target = TcpStream::connect((host, port as u16)).await?;
+            reply.accept().await;
+            tokio::spawn(async move {
+                let _ =
+                    tokio::io::copy_bidirectional(&mut channel.into_stream(), &mut target).await;
+            });
+            Ok(())
+        }
+    }
+
+    async fn agent_test_server() -> (u16, tokio::sync::oneshot::Receiver<russh::server::Handle>) {
+        let mut config = russh::server::Config::default();
+        config.keys.push(
+            russh::keys::PrivateKey::random(
+                &mut rand::rng(),
+                russh::keys::ssh_key::Algorithm::Ed25519,
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server = russh::server::run_stream(
+                Arc::new(config),
+                stream,
+                AgentTestServer {
+                    handle: Some(sender),
+                },
+            )
+            .await
+            .unwrap();
+            let _ = server.await; // The client closes the test connection after each case.
+        });
+        (port, receiver)
+    }
+
+    // Run the socket test in a child process so SSH_AUTH_SOCK is isolated from
+    // other tests and agent authentication on the test runner's machine.
+    #[tokio::test]
+    async fn incoming_agent_channels_respect_each_hosts_setting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if std::env::var_os("BASTION_AGENT_TEST_DIR").is_none() {
+            let dir =
+                std::env::temp_dir().join(format!("bastion-agent-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ssh::tests::incoming_agent_channels_respect_each_hosts_setting",
+                    "--nocapture",
+                ])
+                .env("BASTION_AGENT_TEST_DIR", &dir)
+                .env("SSH_AUTH_SOCK", dir.join("agent.sock"))
+                .status()
+                .unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(result.success(), "isolated agent forwarding test failed");
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(std::env::var_os("BASTION_AGENT_TEST_DIR").unwrap());
+        let listener = tokio::net::UnixListener::bind(dir.join("agent.sock")).unwrap();
+        let key = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let key_path = dir.join("client_key");
+        std::fs::write(
+            &key_path,
+            key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+
+        // Exercise direct and tunneled targets, including opposite settings on
+        // the jump and target servers. Neither server requests forwarding.
+        for (case, (target_allowed, jump_allowed)) in [
+            (false, None),
+            (true, None),
+            (false, Some(true)),
+            (true, Some(false)),
+            (false, Some(false)),
+            (true, Some(true)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (target_port, target_handle) = agent_test_server().await;
+            let mut target = Host::new("target".into(), "127.0.0.1".into(), "test".into());
+            target.port = target_port as i64;
+            target.auth = HostAuth::KeyFile(key_path.to_string_lossy().into_owned());
+            target.forward_agent = target_allowed;
+            let (jump, jump_handle) = if let Some(allowed) = jump_allowed {
+                let (port, handle) = agent_test_server().await;
+                let mut host = target.clone();
+                host.port = port as i64;
+                host.forward_agent = allowed;
+                (Some(host), Some(handle))
+            } else {
+                (None, None)
+            };
+            let session = connect(
+                &target,
+                None,
+                Some(dir.join(format!("known_hosts_{case}"))),
+                jump,
+            )
+            .await
+            .unwrap();
+            let mut servers = vec![(target_allowed, target_handle.await.unwrap())];
+            if let Some(handle) = jump_handle {
+                servers.push((jump_allowed.unwrap(), handle.await.unwrap()));
+            }
+            for (allowed, server) in servers {
+                let result =
+                    tokio::time::timeout(Duration::from_secs(5), server.channel_open_agent())
+                        .await
+                        .unwrap();
+                if allowed {
+                    let mut remote = result
+                        .expect("authorized agent channel should be accepted")
+                        .into_stream();
+                    let (mut agent, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    remote.write_all(b"request").await.unwrap();
+                    let mut request = [0; 7];
+                    tokio::time::timeout(Duration::from_secs(5), agent.read_exact(&mut request))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&request, b"request");
+                    agent.write_all(b"reply").await.unwrap();
+                    let mut reply = [0; 5];
+                    tokio::time::timeout(Duration::from_secs(5), remote.read_exact(&mut reply))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&reply, b"reply");
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(russh::Error::ChannelOpenFailure(
+                                russh::ChannelOpenFailure::AdministrativelyProhibited
+                            ))
+                        ),
+                        "unauthorized channel must be rejected"
+                    );
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err(),
+                        "unauthorized channel reached the agent socket"
+                    );
+                }
+            }
+            drop(session);
+        }
+    }
 
     /// Tre situationer som ser likadana ut för användaren men kräver
     /// helt olika saker. Den mellersta är den som annars är omöjlig att
@@ -1895,6 +2107,7 @@ mod tests {
                     KnownHosts::open(Some(crate::test_support::known_hosts_path())).ok()?,
                 ),
                 remote_forwards: RemoteForwards::default(),
+                forward_agent: host.forward_agent,
             };
             let mut session =
                 client::connect(config, ("127.0.0.1", relay_port), handler).await.ok()?;
