@@ -4,6 +4,8 @@
 
 Bastion is an SSH client. This repo holds the version for Linux with GTK 4, built with Rust, GTK 4, libadwaita, VTE and russh. The other platforms have their own repos: [Bastion for Apple](https://github.com/Pissmyran/bastion-apple), [Bastion for Windows](https://github.com/Pissmyran/bastion-windows), [Bastion for Android](https://github.com/Pissmyran/bastion-android). The [Bastion hub](https://github.com/Pissmyran/bastion) ties them together.
 
+SFTP drag-and-drop uploads skip directory symlinks; file symlinks upload their target contents.
+
 ## Contents
 
 | Path | Contents |

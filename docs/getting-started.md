@@ -1,5 +1,7 @@
 # Getting started
 
+SFTP drag-and-drop uploads skip directory symlinks; file symlinks upload their target contents.
+
 ## Prerequisites
 
 Rust (latest stable) and the GTK development packages above.

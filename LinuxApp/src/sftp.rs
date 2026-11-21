@@ -11,6 +11,8 @@
 use crate::host::Host;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -133,15 +135,33 @@ impl SftpHandle {
 /// redan"-statuskod förrän v6) — om katalogen redan finns fortsätter
 /// uppladdningen ändå in i den; ett EKTA behörighetsfel avslöjas istället
 /// av den efterföljande skrivningen, som INTE ignoreras.
+/// Directory symlinks are skipped, including when selected directly. File
+/// symlinks retain their existing behavior and upload the target contents.
 pub fn upload_path_recursive<'a>(
     handle: &'a SftpHandle,
     local_path: &'a std::path::Path,
     remote_path: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>> {
     Box::pin(async move {
-        if local_path.is_dir() {
+        // A trailing slash or `/.` would otherwise make the OS follow a
+        // directory symlink before symlink_metadata or O_NOFOLLOW sees it.
+        let local_path = local_path.components().as_path();
+        let metadata = std::fs::symlink_metadata(local_path).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() && local_path.is_dir() {
+            return Ok(());
+        }
+        if metadata.is_dir() {
+            // Anchor the traversal to the opened directory. Checking metadata
+            // alone would allow a directory to be replaced by a symlink before
+            // read_dir or a recursive call uses its path.
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(local_path)
+                .map_err(|e| e.to_string())?;
+            let anchored_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
             let _ = handle.mkdir(remote_path.to_string()).await;
-            let entries = std::fs::read_dir(local_path).map_err(|e| e.to_string())?;
+            let entries = std::fs::read_dir(anchored_path).map_err(|e| e.to_string())?;
             for entry in entries {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -427,6 +447,93 @@ mod preview_tests {
 mod tests {
     use super::*;
     use crate::host::{Host, HostAuth};
+
+    // A local command receiver exercises the upload without requiring an sshd.
+    fn upload_test_handle(
+        on_mkdir: impl Fn(&str) + Send + 'static,
+    ) -> (SftpHandle, std::thread::JoinHandle<Vec<(String, Option<Vec<u8>>)>>) {
+        let (tx, rx) = async_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            let mut operations = Vec::new();
+            while let Ok(command) = rx.recv_blocking() {
+                match command {
+                    Command::Mkdir { path, reply } => {
+                        on_mkdir(&path);
+                        operations.push((path, None));
+                        let _ = reply.send_blocking(Ok(()));
+                    }
+                    Command::Write { path, data, reply } => {
+                        operations.push((path, Some(data)));
+                        let _ = reply.send_blocking(Ok(()));
+                    }
+                    _ => panic!("unexpected upload command"),
+                }
+            }
+            operations
+        });
+        (SftpHandle { tx }, worker)
+    }
+
+    #[test]
+    fn upload_skips_directory_links_but_uploads_files_and_file_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("bastion-upload-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::write(root.join("tree/sub/file"), b"content").unwrap();
+        symlink("sub", root.join("tree/alias")).unwrap();
+        symlink("..", root.join("tree/sub/cycle")).unwrap();
+        symlink("sub/file", root.join("tree/file-link")).unwrap();
+        symlink("tree", root.join("selected-link")).unwrap();
+
+        let (handle, worker) = upload_test_handle(|_| {});
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            upload_path_recursive(&handle, &root.join("tree"), "remote").await.unwrap();
+            upload_path_recursive(&handle, &root.join("selected-link"), "selected").await.unwrap();
+            upload_path_recursive(&handle, &root.join("selected-link/"), "selected-slash").await.unwrap();
+            upload_path_recursive(&handle, &root.join("selected-link/."), "selected-dot").await.unwrap();
+            assert!(upload_path_recursive(&handle, &root.join("missing"), "missing").await.is_err());
+        });
+        drop(handle);
+        let mut operations = worker.join().unwrap();
+        operations.sort();
+        assert_eq!(operations, vec![
+            ("remote".into(), None),
+            ("remote/file-link".into(), Some(b"content".to_vec())),
+            ("remote/sub".into(), None),
+            ("remote/sub/file".into(), Some(b"content".to_vec())),
+        ]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upload_keeps_open_directory_when_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("bastion-upload-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("tree/original"), b"original").unwrap();
+        std::fs::write(root.join("other/replacement"), b"replacement").unwrap();
+        let swap_root = root.clone();
+        let (handle, worker) = upload_test_handle(move |path| {
+            if path == "remote" {
+                std::fs::rename(swap_root.join("tree"), swap_root.join("moved")).unwrap();
+                symlink("other", swap_root.join("tree")).unwrap();
+            }
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            upload_path_recursive(&handle, &root.join("tree"), "remote").await.unwrap();
+        });
+        drop(handle);
+        let mut operations = worker.join().unwrap();
+        operations.sort();
+        assert_eq!(operations, vec![
+            ("remote".into(), None),
+            ("remote/original".into(), Some(b"original".to_vec())),
+        ]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Riktig end-to-end-övning mot localhosts sshd: mkdir/write/read/list/
     /// rename/remove i en engångsmapp under /tmp — skapar och tar bort sin
