@@ -16,10 +16,9 @@
 //! fil) är ett öppet designval som inte avgörs här.
 //!
 //! **Lagring:** en enkel lokal JSON-fil (`~/.bastion/oauth_tokens.json`) —
-//! samma skyddsnivå som S3-kopplingarnas `secret_access_key`/WireGuard-
-//! privatnycklar redan har i den här klienten (`s3.rs`/`wireguard.rs`),
-//! INTE macOS Keychain (som Swift-sidan använder — Linux har ingen
-//! universell motsvarighet över skrivbordsmiljöer; freedesktop Secret
+//! med ägarskyddade filrättigheter, men inte macOS Keychain (som Swift-sidan
+//! använder — Linux har ingen universell motsvarighet över skrivbordsmiljöer;
+//! freedesktop Secret
 //! Service är en egen beroende-yta som inte är motiverad förrän en faktisk
 //! kontosynk-transport — INTE bara inloggningen, se `LoginSession`s
 //! dokumentation — är byggd).
@@ -402,26 +401,61 @@ impl OAuthTokenStore {
         OAuthTokenStore { path }
     }
 
-    fn load_all(&self) -> std::collections::HashMap<String, StoredOAuthToken> {
-        let Ok(data) = std::fs::read_to_string(&self.path) else {
-            return std::collections::HashMap::new();
+    fn secure_parent(&self) -> std::io::Result<&std::path::Path> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "token path has no parent directory")
+        })?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        Ok(parent)
+    }
+
+    fn load_all(&self) -> std::io::Result<std::collections::HashMap<String, StoredOAuthToken>> {
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        self.secure_parent()?;
+        let mut file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
+            Err(e) => return Err(e),
         };
-        serde_json::from_str(&data).unwrap_or_default()
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "token path is not a regular file"));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut data = String::new();
+        file.read_to_string(&mut data)?;
+        Ok(serde_json::from_str(&data).unwrap_or_default())
     }
 
     fn save_all(&self, all: &std::collections::HashMap<String, StoredOAuthToken>) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let parent = self.secure_parent()?;
+        let tmp_path = parent.join(format!(".oauth-tokens-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp_path)?;
+        let result = (|| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(serde_json::to_string(all).expect("StoredOAuthToken serialiserar alltid").as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &self.path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
         }
-        std::fs::write(&self.path, serde_json::to_string(all).expect("StoredOAuthToken serialiserar alltid"))
+        result
     }
 
     pub fn is_logged_in(&self, provider: &OAuthProviderConfig) -> bool {
-        self.load_all().contains_key(provider.id)
+        self.load_all().unwrap_or_default().contains_key(provider.id)
     }
 
     pub fn logout(&self, provider: &OAuthProviderConfig) -> std::io::Result<()> {
-        let mut all = self.load_all();
+        let mut all = self.load_all()?;
         all.remove(provider.id);
         self.save_all(&all)
     }
@@ -431,11 +465,11 @@ impl OAuthTokenStore {
     /// `is_logged_in`/`save`/`logout`.
     #[allow(dead_code)]
     pub fn load(&self, provider: &OAuthProviderConfig) -> Option<StoredOAuthToken> {
-        self.load_all().get(provider.id).cloned()
+        self.load_all().unwrap_or_default().get(provider.id).cloned()
     }
 
     pub fn save(&self, provider: &OAuthProviderConfig, token: &StoredOAuthToken) -> std::io::Result<()> {
-        let mut all = self.load_all();
+        let mut all = self.load_all()?;
         all.insert(provider.id.to_string(), token.clone());
         self.save_all(&all)
     }
@@ -791,6 +825,72 @@ mod tests {
         assert_eq!(store.load(&dropbox), None);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn store_protects_new_and_existing_tokens_on_read_and_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store();
+        let provider = dropbox();
+        let token = StoredOAuthToken { access_token: "AT".into(), refresh_token: Some("RT".into()), expires_at: None };
+        store.save(&provider, &token).unwrap();
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&store.path), 0o600);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.load(&provider), Some(token.clone()));
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&store.path), 0o600);
+
+        store.save(&provider, &token).unwrap();
+        assert_eq!(mode(&store.path), 0o600);
+        store.logout(&provider).unwrap();
+        assert_eq!(mode(&store.path), 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn store_rejects_symlinked_token_file_without_modifying_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (store, dir) = test_store();
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &store.path).unwrap();
+        let token = StoredOAuthToken { access_token: "AT".into(), refresh_token: None, expires_at: None };
+        assert!(store.save(&dropbox(), &token).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_removes_the_private_temporary_file() {
+        let (store, dir) = test_store();
+        std::fs::create_dir_all(&store.path).unwrap();
+        assert!(store.save_all(&std::collections::HashMap::new()).is_err());
+        assert!(store.path.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn store_rejects_non_regular_token_file_without_changing_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store();
+        std::fs::create_dir_all(&store.path).unwrap();
+        std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let token = StoredOAuthToken { access_token: "AT".into(), refresh_token: None, expires_at: None };
+        assert!(store.save(&dropbox(), &token).is_err());
+        assert_eq!(std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
