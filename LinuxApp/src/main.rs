@@ -2037,6 +2037,10 @@ fn show_ssh_config_import_dialog(
         #[strong]
         status_label,
         #[weak]
+        read_file_button,
+        #[strong]
+        import_button,
+        #[weak]
         win,
         move |_| {
             let Some(home) = dirs::home_dir() else {
@@ -2044,21 +2048,46 @@ fn show_ssh_config_import_dialog(
                 return;
             };
             let path = home.join(".ssh").join("config");
-            if !path.exists() {
-                status_label.set_label(&format!("{} finns inte.", path.display()));
-                return;
-            }
-            match store.borrow_mut().import_ssh_config_file(&path) {
-                Ok(n) => {
-                    refresh_list(&list, &store, &app, &area, &settings_store, &snippet_store, &search_query);
-                    if n > 0 {
-                        win.close();
-                    } else {
-                        status_label.set_label("Inga nya värdar hittades (redan importerade, eller inget alias hade en användare angiven).");
+            read_file_button.set_sensitive(false);
+            import_button.set_sensitive(false);
+            status_label.set_label("Läser ssh-config…");
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = ssh_config::SSHConfig::parse_file(&path)
+                    .map(|config| ssh_config::prepare_import(&config))
+                    .map_err(|e| format!("Kunde inte läsa {}: {e}", path.display()));
+                let _ = tx.send_blocking(result);
+            });
+            glib::spawn_future_local(clone!(
+                #[weak] win,
+                #[weak] list,
+                #[strong] app,
+                #[strong] store,
+                #[strong] area,
+                #[strong] settings_store,
+                #[strong] snippet_store,
+                #[strong] search_query,
+                #[strong] status_label,
+                #[strong] read_file_button,
+                #[strong] import_button,
+                async move {
+                    let result = rx.recv().await.unwrap_or_else(|_| Err("Kunde inte läsa ssh-config.".to_string()));
+                    if !win.is_visible() { return; }
+                    read_file_button.set_sensitive(true);
+                    import_button.set_sensitive(true);
+                    match result.and_then(|hosts| store.borrow_mut().import_prepared(hosts).map_err(|e| e.to_string())) {
+                        Ok(n) => {
+                            refresh_list(&list, &store, &app, &area, &settings_store, &snippet_store, &search_query);
+                            if n > 0 {
+                                win.close();
+                            } else {
+                                status_label.set_label("Inga nya värdar hittades (redan importerade, eller inget alias hade en användare angiven).");
+                            }
+                        }
+                        Err(e) => status_label.set_label(&e),
                     }
                 }
-                Err(e) => status_label.set_label(&format!("Kunde inte läsa {}: {e}", path.display())),
-            }
+            ));
         }
     ));
     import_button.connect_clicked(clone!(

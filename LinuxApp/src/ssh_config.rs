@@ -42,6 +42,27 @@ pub struct SSHConfig {
 /// config som direkt eller indirekt inkluderar sig själv ska ge en
 /// trunkerad läsning, inte en oändlig loop.
 const MAX_INCLUDE_DEPTH: usize = 16;
+// These budgets apply to the entire expanded file, including repeated includes.
+const MAX_CONFIG_FILES: usize = 512;
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_CONFIG_ENTRIES: usize = 4096;
+const MAX_HOST_PATTERNS: usize = 256;
+const MAX_DIRECTORY_ENTRIES: usize = 8192;
+
+#[derive(Default)]
+struct IncludeBudget {
+    files: usize,
+    bytes: usize,
+    entries: usize,
+    patterns: usize,
+    directory_entries: usize,
+    targets: usize,
+    active: Vec<(u64, u64)>,
+}
+
+fn limit_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "SSH config import resource limit exceeded")
+}
 
 impl SSHConfig {
     /// Läser en config-TEXT utan att röra filsystemet. `Include`-rader
@@ -49,7 +70,7 @@ impl SSHConfig {
     /// [`SSHConfig::parse_file`] när filen finns på disk.
     pub fn parse(text: &str) -> SSHConfig {
         let mut entries = Vec::new();
-        collect_entries(text, None, 0, &mut entries);
+        collect_entries(text, None, 0, &mut entries, None).expect("text parsing has no file limits");
         SSHConfig { entries }
     }
 
@@ -66,10 +87,10 @@ impl SSHConfig {
     /// alternativet att en enda död sökväg gör att INGA värdar
     /// importeras — sämre för det här användningsfallet.
     pub fn parse_file(path: &std::path::Path) -> std::io::Result<SSHConfig> {
-        let text = std::fs::read_to_string(path)?;
         let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut entries = Vec::new();
-        collect_entries(&text, Some(&base), 0, &mut entries);
+        let mut budget = IncludeBudget::default();
+        collect_file(path, &base, 0, &mut entries, &mut budget, true)?;
         Ok(SSHConfig { entries })
     }
 
@@ -213,45 +234,98 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// Delar en rad i (nyckel-gemener, värde). Stöder `Key Value`, `Key=Value`,
-/// `Key = Value` och citerade värden. Returnerar `None` för tomma/
-/// kommentarrader.
 /// Tolkar en config-text till poster, och expanderar `Include` INLINE på
 /// den plats raden stod. Att inlina är inte en förenkling utan just vad
 /// OpenSSH gör: en inkluderad fils `Host`-block gäller vidare efter
 /// include-punkten, precis som om innehållet stått där direkt.
+// Open nonblocking before checking the opened file, so a FIFO substituted for
+// a config cannot block the importer. Identity is taken from the open handle,
+// which detects cycles through symlinks and hard links as well as paths.
+fn collect_file(
+    path: &std::path::Path,
+    base_dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<Entry>,
+    budget: &mut IncludeBudget,
+    required: bool,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    budget.files += 1;
+    if budget.files > MAX_CONFIG_FILES { return Err(limit_error()); }
+    let read = (|| -> std::io::Result<_> {
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SSH config is not a regular file"));
+        }
+        Ok((file, (metadata.dev(), metadata.ino())))
+    })();
+    let (file, id) = match read {
+        Ok(file) => file,
+        Err(_) if !required => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if budget.active.contains(&id) { return Ok(()); }
+    let remaining = MAX_CONFIG_BYTES - budget.bytes;
+    let mut bytes = Vec::new();
+    let result = file.take((remaining + 1) as u64).read_to_end(&mut bytes);
+    if bytes.len() > remaining { return Err(limit_error()); }
+    budget.bytes += bytes.len();
+    if let Err(e) = result {
+        return if required { Err(e) } else { Ok(()) };
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) if required => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Err(_) => return Ok(()),
+    };
+    budget.active.push(id);
+    let result = collect_entries(&text, Some(base_dir), depth, out, Some(budget));
+    budget.active.pop();
+    result
+}
+
 fn collect_entries(
     text: &str,
     base_dir: Option<&std::path::Path>,
     depth: usize,
     out: &mut Vec<Entry>,
-) {
+    mut budget: Option<&mut IncludeBudget>,
+) -> std::io::Result<()> {
     for raw_line in text.split(['\n', '\r']) {
         let Some((key, value)) = tokenize(raw_line) else { continue };
+        if key == "include" {
+            let Some(base_dir) = base_dir else { continue };
+            if depth >= MAX_INCLUDE_DEPTH { continue; }
+            let budget = budget.as_deref_mut().expect("file parsing has a budget");
+            for path in resolve_include(&value, base_dir, budget)? {
+                collect_file(&path, base_dir, depth + 1, out, budget, false)?;
+            }
+            continue;
+        }
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.entries += 1;
+            if budget.entries > MAX_CONFIG_ENTRIES { return Err(limit_error()); }
+        }
         match key.as_str() {
             "host" => {
-                let patterns: Vec<String> = value
-                    .split([' ', '\t'])
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
+                let mut patterns = Vec::new();
+                for pattern in value.split([' ', '\t']).filter(|s| !s.is_empty()) {
+                    if let Some(budget) = budget.as_deref_mut() {
+                        budget.patterns += 1;
+                        if budget.patterns > MAX_HOST_PATTERNS { return Err(limit_error()); }
+                    }
+                    patterns.push(pattern.to_string());
+                }
                 out.push(Entry::Host(patterns));
             }
             "match" => out.push(Entry::Match(value)),
-            "include" => {
-                let Some(base_dir) = base_dir else { continue };
-                if depth >= MAX_INCLUDE_DEPTH {
-                    continue;
-                }
-                for path in resolve_include(&value, base_dir) {
-                    if let Ok(nested) = std::fs::read_to_string(&path) {
-                        collect_entries(&nested, Some(base_dir), depth + 1, out);
-                    }
-                }
-            }
             _ => out.push(Entry::Setting(key, value)),
         }
     }
+    Ok(())
 }
 
 /// Löser upp en `Include`-rads sökvägar till konkreta filer.
@@ -265,9 +339,11 @@ fn collect_entries(
 /// Träffarna sorteras. OpenSSH läser glob-träffar i den ordning `glob(3)`
 /// ger, vilket är sorterad ordning — och ordningen spelar roll, eftersom
 /// första värdet vinner per nyckel.
-fn resolve_include(value: &str, base_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn resolve_include(value: &str, base_dir: &std::path::Path, budget: &mut IncludeBudget) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     for raw in value.split([' ', '\t']).filter(|s| !s.is_empty()) {
+        budget.targets += 1;
+        if budget.targets > MAX_CONFIG_FILES { return Err(limit_error()); }
         let expanded = expand_tilde(raw);
         let candidate = std::path::Path::new(&expanded);
         let full = if candidate.is_absolute() {
@@ -290,17 +366,26 @@ fn resolve_include(value: &str, base_dir: &std::path::Path) -> Vec<std::path::Pa
         };
         let pattern = pattern.to_string_lossy().into_owned();
         let Ok(read) = std::fs::read_dir(dir) else { continue };
-        let mut matches: Vec<std::path::PathBuf> = read
-            .flatten()
-            .filter(|e| glob(&pattern, &e.file_name().to_string_lossy()))
-            .map(|e| e.path())
-            .collect();
+        let mut matches = Vec::new();
+        for entry in read {
+            budget.directory_entries += 1;
+            if budget.directory_entries > MAX_DIRECTORY_ENTRIES { return Err(limit_error()); }
+            let Ok(entry) = entry else { continue };
+            if glob(&pattern, &entry.file_name().to_string_lossy()) {
+                budget.targets += 1;
+                if budget.targets > MAX_CONFIG_FILES { return Err(limit_error()); }
+                matches.push(entry.path());
+            }
+        }
         matches.sort();
         out.extend(matches);
     }
-    out
+    Ok(out)
 }
 
+/// Delar en rad i (nyckel-gemener, värde). Stöder `Key Value`, `Key=Value`,
+/// `Key = Value` och citerade värden. Returnerar `None` för tomma/
+/// kommentarrader.
 fn tokenize(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -393,6 +478,15 @@ pub fn imported_hosts(config: &SSHConfig) -> Vec<crate::host::Host> {
             Some(host)
         })
         .collect()
+}
+
+/// Resolve hosts and jump aliases before updating the store, so file imports
+/// can do the expensive config traversal on a worker thread.
+pub fn prepare_import(config: &SSHConfig) -> Vec<(crate::host::Host, Option<String>)> {
+    imported_hosts(config).into_iter().map(|host| {
+        let jump = config.resolve(&host.alias).proxy_jump.as_deref().and_then(proxy_jump_alias);
+        (host, jump)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -665,6 +759,68 @@ Host nouser
         // Omimport ska fortfarande inte skapa dubbletter.
         assert_eq!(store.import_ssh_config_file(&dir.join("config")).unwrap(), 0);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn active_cycles_are_skipped_but_repeated_includes_keep_their_order() {
+        let dir = temp_config_dir();
+        std::fs::write(dir.join("config"), "Include child\nInclude child\n").unwrap();
+        std::fs::write(dir.join("child"), "Include alias\nHost example\nUser first\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("config"), dir.join("alias")).unwrap();
+        let config = SSHConfig::parse_file(&dir.join("config")).unwrap();
+        assert_eq!(config.entries.len(), 4);
+        assert_eq!(config.resolve("example").user.as_deref(), Some("first"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn branching_includes_fail_without_importing_partial_results() {
+        let dir = temp_config_dir();
+        for i in 0..10 {
+            let content = if i == 9 { "Host example\nUser a\n".to_string() }
+                else { format!("Include f{} f{}\n", i + 1, i + 1) };
+            std::fs::write(dir.join(format!("f{i}")), content).unwrap();
+        }
+        let mut store = crate::host::HostStore::open(dir.join("hosts.json")).unwrap();
+        let err = store.import_ssh_config_file(&dir.join("f0")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(store.all().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expanded_bytes_and_entries_are_bounded() {
+        let dir = temp_config_dir();
+        std::fs::write(dir.join("config"), "Include child child\n").unwrap();
+        std::fs::write(dir.join("child"), format!("#{}\n", "a".repeat(MAX_CONFIG_BYTES / 2))).unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::write(dir.join("child"), "User a\n".repeat(MAX_CONFIG_ENTRIES / 2 + 1)).unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::write(dir.join("config"), format!("Host {}\n", "alias ".repeat(MAX_HOST_PATTERNS + 1))).unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wildcard_enumeration_and_missing_targets_are_bounded() {
+        let dir = temp_config_dir();
+        std::fs::write(dir.join("config"), format!("Include {}\n", "missing ".repeat(MAX_CONFIG_FILES + 1))).unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        for i in 0..20 { std::fs::write(dir.join(format!("entry{i}")), "").unwrap(); }
+        std::fs::write(dir.join("config"), format!("Include {}\n", "nomatch* ".repeat(500))).unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_regular_include_is_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = temp_config_dir();
+        let fifo = std::ffi::CString::new(dir.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(dir.join("config"), "Include fifo\nHost example\nUser a\n").unwrap();
+        assert_eq!(SSHConfig::parse_file(&dir.join("config")).unwrap().host_aliases(), vec!["example"]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_config_dir() -> std::path::PathBuf {
